@@ -124,6 +124,7 @@ UEFI firmware
 | keystore2 aborts / KeyMint hangs | Trusty/StrongBox KeyMint need the GSC | patched `libkm_compat.so` (software KeyMint), StrongBox APEX hidden |
 | Linux Terminal never starts its VM | Trusty Secretkeeper never answers | hide Secretkeeper's VINTF declaration |
 | Logs truncated, stick corrupted | vold `fsck_msdos`'d the stick while mounted | remove vold's `voldmanaged=usb` fstab rule |
+| Android knows no temperature (`ThermalHal cannot read any sensor data`); CPU at its highest clocks all the time | busybox `modprobe` cuts a modalias to 55 characters, so the coldplug never loaded `x86_pkg_temp_thermal` (CPU feature `01C6` is far down the ~900-character CPU modalias); Google's default thermal HAL config has no sensors; our scripts forced governor/EPP `performance` on every machine, over Google's `powertool` default | `usb/hwdetect.sh` matches long modaliases itself (also DMI drivers such as `dell_laptop`); the CPU package sensor is given to the thermal HAL, report only (`THERMAL_HAL=0` turns it off); after boot the CPU follows `powertool` (powersave + `balance_performance`) except in software rendering or with `CPU_PERFORMANCE=1` (`usb/optimize.sh`); `logs/boot-N/power.txt` shows the result |
 | No sound | Google uses SOF; our kernel has legacy HDA | `usb/audio/` config for the `dras` audio HAL (card id `PCH`) |
 | White veil, lifted blacks (even video) | drm_hwcomposer loads its xe `LOG_GAMMA_LUT` curve into i915's linear `GAMMA_LUT` every frame | `kernel/isa_emu_patch/i915_ignore_gamma.sh` (kernel #29) |
 | Everything too big | `ro.sf.lcd_density=260` for Google's panel | `RESOLUTION` in `gbos.cfg` (default 2400x1350, stock density); `DENSITY` optional |
@@ -374,7 +375,7 @@ During installation, live progress bars indicate system image and driver/firmwar
 ### Debugging workflow
 The system writes logs to its own `GBOSSYS` (or `GBOS`) partition. To read them, boot the stick, choose
 menu **2**, then **3 (Only save its logs)** (or 1 to update too), and read `gbos/logs/boot-N/nvme-logs/` on the stick from a computer. Each boot dir has
-`kmsg.log`, `stage0-dmesg.txt`, rotated `logcat.txt*`, `crash.txt`, `hw.txt`, `audio.txt`, and `pstore-prev/`.
+`kmsg.log`, `stage0-dmesg.txt`, rotated `logcat.txt*`, `crash.txt`, `hw.txt`, `audio.txt`, `power.txt` (CPU governor/EPP and temperatures, 90 s after boot), and `pstore-prev/`.
 FAT has no journal: always shut down from Android's power menu, not the physical power button.
 
 ### Display size

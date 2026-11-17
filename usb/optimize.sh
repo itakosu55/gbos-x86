@@ -1,19 +1,77 @@
 #!/system/bin/sh
 # GBOS System, Performance, RAM and CPU Optimization
 # Configured for PC hardware running gbOS86
+#   optimize.sh               gbos_optimize (gbos.rc), once after boot_completed
+#   optimize.sh cpu MODE      only gbos_cpu_power MODE (gbos.rc runs "cpu balanced" at boot_completed)
+
+# --- cpu power (tested by tools/test_power.sh) ---
+# hook.sh puts every CPU at governor/EPP "performance" while Android boots. At boot_completed Google's powertool sets its own default
+# (vendor powertool.rc, "set-default-power-preference": governor powersave + EPP balance_performance, logged by powertool) and the
+# power HAL changes it later through vendor.powerhal.governor/epp. Until 2026-11-17 this script forced "performance" back on every
+# machine; meant for software rendering, it also pinned laptops with a hardware GPU at their highest clocks (intel_pstate's
+# "performance" policy raises the HWP minimum to the maximum): battery and heat (HANDOFF.md 2026-11-17).
+#   balanced     gbos.rc, at boot_completed and just before powertool (system rc actions run before vendor ones), so powertool has
+#                the last word as on Google's own machines. Undoes only the boot-time "performance": EPP drivers (intel_pstate,
+#                amd-pstate-epp in active mode) get governor powersave + EPP balance_performance; the others (acpi-cpufreq,
+#                intel_cpufreq / amd-pstate in passive mode) get schedutil (or ondemand), because "powersave" pins them at their
+#                lowest frequency.
+#   guard        after powertool, hardware GPU: only that last case, in case powertool picked "powersave" on such a driver.
+#   performance  after powertool: software rendering (the CPU draws every frame) or CPU_PERFORMANCE=1 in gbos.cfg
+#                (hook.sh sets ro.gbos.cpu_performance=1 for both).
+# Writes one summary line to the kernel log (kmsg.log). CPUFREQ= and KMSG= are only for tests.
+gbos_cpu_power() {
+    _n=0; _all=
+    for _p in "${CPUFREQ:-/sys/devices/system/cpu/cpufreq}"/policy*; do
+        [ -f "$_p/scaling_governor" ] || continue
+        _n=$((_n + 1))
+        _gov=$(cat "$_p/scaling_governor" 2>/dev/null)
+        if [ "$1" = performance ]; then
+            echo performance > "$_p/scaling_governor" 2>/dev/null
+            [ -f "$_p/energy_performance_preference" ] && echo performance > "$_p/energy_performance_preference" 2>/dev/null
+        elif [ -f "$_p/energy_performance_preference" ]; then
+            if [ "$1" = balanced ]; then
+                # The governor first: intel_pstate refuses any other EPP (EBUSY) while the policy is "performance".
+                [ "$_gov" = performance ] && echo powersave > "$_p/scaling_governor" 2>/dev/null
+                [ "$(cat "$_p/energy_performance_preference" 2>/dev/null)" = performance ] \
+                    && echo balance_performance > "$_p/energy_performance_preference" 2>/dev/null
+            fi
+        else
+            case "$1:$_gov" in
+                balanced:performance|balanced:powersave|guard:powersave)
+                    for _g in schedutil ondemand; do
+                        grep -qw "$_g" "$_p/scaling_available_governors" 2>/dev/null \
+                            && { echo "$_g" > "$_p/scaling_governor" 2>/dev/null; break; }
+                    done;;
+            esac
+        fi
+        _epp=-; [ -f "$_p/energy_performance_preference" ] && _epp=$(cat "$_p/energy_performance_preference" 2>/dev/null)
+        _all="$_all
+$(cat "$_p/scaling_driver" 2>/dev/null) $(cat "$_p/scaling_governor" 2>/dev/null)/$_epp"
+    done
+    # One "driver governor/EPP" per distinct setting (all policies alike: one), e.g. "intel_pstate powersave/balance_performance".
+    _all=$(echo "$_all" | sed '/^$/d' | sort -u | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    echo "gbos-cpu: $1: $_n cpufreq policies: ${_all:-none}" > "${KMSG:-/dev/kmsg}" 2>/dev/null
+}
+# --- end cpu power ---
+if [ "$1" = cpu ]; then
+    gbos_cpu_power "${2:-balanced}"
+    exit 0
+fi
 
 sleep 4
 
 # ==============================================================================
 # 1. HARDWARE & CPU PERFORMANCE
 # ==============================================================================
-# Set CPU governor to maximum performance to prevent throttling on software rendering
-for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo performance > "$g" 2>/dev/null
-done
-for g in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
-    echo performance > "$g" 2>/dev/null
-done
+# CPU governor/EPP: see gbos_cpu_power above. powertool's boot-time exec sets vendor.powertool.init=1 when it is done; wait for it
+# (at most 15 s more) so that what follows is applied after it, not overwritten by it.
+_w=0
+while [ "$(getprop vendor.powertool.init)" != 1 ] && [ $_w -lt 15 ]; do sleep 1; _w=$((_w + 1)); done
+if [ "$(getprop ro.gbos.cpu_performance)" = 1 ]; then
+    gbos_cpu_power performance
+else
+    gbos_cpu_power guard
+fi
 
 # Disable USB autosuspend on mice/keyboards so there is no wake latency
 for d in /sys/bus/usb/devices/*/power/control; do
