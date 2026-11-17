@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""run_shutdown_qemu.py [KERNEL] -- check usb/shutdown.sh on the real kernel (default usb/out/BOOTX64.EFI) in QEMU.
+"""run_shutdown_qemu.py [KERNEL] [--script SHUTDOWN_SH] -- check usb/shutdown.sh on the real kernel (default usb/out/BOOTX64.EFI) in QEMU.
 
 Two boots with the same layout as an NVMe install: GBOSSYS (FAT32) on one NVMe disk, GBOS_META (ext4) on another.
 The initramfs does what stage0 does: mounts GBOSSYS rw at /gbos, starts the same helpers (kmsg.log copier, 5 s sync loop, and a
-process holding kvmtrace.txt open for writing, like the kvm-trace dd), puts a read-only loop device on a file on the FAT (as super.img),
-mounts /metadata and switches root. In the new root (Android's place) it starts a writer in its own process group (a gbos_logcat that
-has not exited), a process in group 0 with the new root (like an init subcontext: must survive) and a reader of the loop image file.
+process holding kvmtrace.txt open for writing, like the kvm-trace dd), puts a read-only loop device on a file on the FAT (as super.img)
+and a writable one on another file (as hook.sh's bootdisk.img on loop6, which kept GBOSSYS busy on the dynabook GZ/HWL), mounts
+/metadata and switches root. In the new root (Android's place) it starts a writer in its own process group (a gbos_logcat that has not
+exited), a process in group 0 with the new root (like an init subcontext: must survive), a reader of the loop image file and a process
+holding the writable loop device open (as the boot HAL might hold misc).
   boot 1 (control): power off without shutdown.sh -> the FAT must come back dirty and ext4 must need journal recovery (the bug).
   boot 2 (fix): run shutdown.sh, then power off -> FAT clean, ext4 clean, the stage0 helpers and the writer gone, the others alive,
-                and shutdown.txt readable.
+                the writable loop detached (its holder gone) and shutdown.txt readable.
+--script runs another shutdown.sh in the fix boot (e.g. an older one, to see it fail).
 The FAT dirty bit is read from the boot sector (FAT32 state byte, offset 0x41, bit 0) and with fsck.fat -n; ext4 with dumpe2fs -h.
 Prints SHUTDOWN_QEMU_PASS when everything holds.
 """
@@ -49,6 +52,10 @@ mkdir -p /new && mount -t tmpfs tmpfs /new
 mkdir -p /new/bin /new/proc /new/sys /new/dev /new/postinstall /new/metadata /new/system
 cp /bin/busybox /new/bin/busybox; cp /init2 /new/init2
 losetup -r /dev/loop0 $G/super.img && mount -t ext2 -o ro /dev/loop0 /new/system || echo "T: loop mount FAILED"
+# hook.sh's boot disk: a writable loop device on a file on the FAT
+dd if=/dev/zero of=$G/bootdisk.img bs=1M count=1 2>/dev/null; sync
+losetup /dev/loop6 $G/bootdisk.img && echo "T: bootdisk on loop6: $(cat /sys/block/loop6/loop/backing_file) ro=$(cat /sys/block/loop6/ro)" \
+  || echo "T: bootdisk loop FAILED"
 mount -t ext4 $META /new/metadata && echo data > /new/metadata/x || echo "T: META mount FAILED"
 mount --bind /gbos /new/postinstall
 echo "T: stage0 done, switching root"
@@ -67,8 +74,11 @@ sleep 100000 &
 KEEP=$!
 setsid sh -c "exec sleep 100000 < /postinstall/gbos/super.img" &
 READER=$!
+setsid sh -c "exec sleep 100000 < /dev/loop6" &
+HOLDER=$!
 sleep 2
-echo "T: mode=$MODE writer=$WRITER keep=$KEEP reader=$READER"
+echo "T: mode=$MODE writer=$WRITER keep=$KEEP reader=$READER holder=$HOLDER"
+[ -e /sys/block/loop6/loop/backing_file ] && echo "T: loop6 attached before: $(cat /sys/block/loop6/loop/backing_file)"
 s0() { for d in /proc/[0-9]*; do p=${d##*/}; [ $p = 1 ] && continue; read -r st < $d/stat 2>/dev/null || continue; set -- ${st##*) }
        [ "$2" = 2 ] || [ $p = 2 ] || [ "$1" = Z ] && continue; [ "$3" = 0 ] && ! [ $d/root -ef /proc/1/root ] && echo -n "$p "; done; }
 echo "T: stage0 helpers before: $(s0)"
@@ -83,6 +93,8 @@ if [ $MODE = fix ]; then
   kill -0 $WRITER 2>/dev/null && echo "T: writer alive" || echo "T: writer gone"
   kill -0 $KEEP 2>/dev/null && echo "T: keep alive" || echo "T: keep gone"
   kill -0 $READER 2>/dev/null && echo "T: reader alive" || echo "T: reader gone"
+  kill -0 $HOLDER 2>/dev/null && echo "T: holder alive" || echo "T: holder gone"
+  [ -e /sys/block/loop6/loop/backing_file ] && echo "T: loop6 still attached" || echo "T: loop6 detached"
   grep -E ' /(postinstall|metadata) ' /proc/mounts | sed 's/^/T: mount after: /'
   grep -c 'marker after shutdown.sh' $L/kmsg.log | sed 's/^/T: kmsg.log lines after: /'
   sed 's/^/T: log: /' $L/shutdown.txt
@@ -125,7 +137,13 @@ def ext4_needs_recovery(meta):
 
 
 def main():
-    kernel = sys.argv[1] if len(sys.argv) > 1 else str(ROOT / "usb/out/BOOTX64.EFI")
+    args = sys.argv[1:]
+    script = ROOT / "usb/shutdown.sh"
+    if "--script" in args:
+        i = args.index("--script")
+        script = pathlib.Path(args[i + 1])
+        del args[i:i + 2]
+    kernel = args[0] if args else str(ROOT / "usb/out/BOOTX64.EFI")
     busybox = ROOT / "kernel/out/busybox"
     if not busybox.exists():
         print("no busybox (kernel/out/busybox): run tools/fetch_busybox.sh")
@@ -134,7 +152,7 @@ def main():
     files = [("dev", 0o40755, b""), ("proc", 0o40755, b""), ("sys", 0o40755, b""), ("bin", 0o40755, b""),
              ("dev/console", 0o20600, b""), ("bin/busybox", 0o100755, bb), ("bin/sh", 0o100755, bb),
              ("init", 0o100755, INIT.encode()), ("init2", 0o100755, INIT2.encode()),
-             ("shutdown.sh", 0o100755, (ROOT / "usb/shutdown.sh").read_bytes())]
+             ("shutdown.sh", 0o100755, script.read_bytes())]
     fails = 0
 
     def check(cond, what):
@@ -161,6 +179,8 @@ def main():
             check("T: END" in out, "%s: the test ran to the end" % mode)
             check("T: stage0 helpers before: " in out and re.search(r"T: stage0 helpers before: \d+ \d+", out),
                   "%s: stage0 helpers are found after switch_root (group 0, initramfs root)" % mode)
+            check(re.search(r"T: bootdisk on loop6: /gbos/gbos/bootdisk.img ro=0", out) is not None,
+                  "%s: a writable loop device on a file on GBOSSYS (as gbos/bootdisk.img)" % mode)
             dirty = fat_dirty(fat)
             rec, state = ext4_needs_recovery(meta)
             fsck = fsck_fat(fat)
@@ -177,6 +197,9 @@ def main():
                 check("T: writer gone" in out, "fix: a process writing to GBOSSYS is killed")
                 check("T: keep alive" in out, "fix: a group-0 process with the new root is kept")
                 check("T: reader alive" in out, "fix: a reader of the image file is kept")
+                check("T: holder gone" in out, "fix: the process holding the writable loop device open is killed")
+                check("T: loop6 detached" in out, "fix: the writable loop device is detached")
+                check("loop6 (/gbos/gbos/bootdisk.img) detached" in out, "fix: the detach is in shutdown.txt (image path as seen from the new root)")
                 check("T: kmsg.log lines after: 0" in out, "fix: kmsg.log stops at shutdown.sh (copier killed)")
                 check("T: FAT read-only" in out, "fix: GBOSSYS is read-only afterwards")
                 check(re.search(r"T: mount after: \S+ /postinstall vfat ro", out) is not None, "fix: /proc/mounts shows /postinstall ro")

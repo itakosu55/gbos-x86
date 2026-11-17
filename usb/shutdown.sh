@@ -16,17 +16,24 @@
 # /. Any other process still writing to GBOSSYS is killed too, by name in the log. /metadata is only remounted, nothing is killed for it:
 # if a file is open there for writing it stays read-write as before (logged with the process).
 #
+# The kernel itself also writes to GBOSSYS, with no process fd to see: a loop device that is not read-only keeps its image file open for
+# writing. hook.sh's gbos/bootdisk.img on loop6 (misc and vbmeta_a/b for the boot HAL) is one: on the dynabook GZ/HWL (boot-10, boot-11)
+# /metadata went read-only but GBOSSYS failed with EBUSY and no writer. Such a loop is detached first; the kernel lets go of the image on
+# the last close, so a process that still has the loop device open is killed (logged). Nothing writes misc after this point.
+#
 # Cost: kmsg.log ends here, so the rest of init's shutdown is not in the log any more. SHUTDOWN_RO=0 in gbos.cfg turns this script off.
-# Not covered: a dual-boot install whose /metadata is gbos/metadata.img on a loop device: that loop keeps the image open read-write, so
-# GBOSSYS stays read-write (logged).
+# Not covered: a dual-boot install whose /metadata is gbos/metadata.img on a loop device: the mount keeps that loop (and so the image)
+# open read-write, so GBOSSYS stays read-write (logged).
 #
 # Log: logs/boot-N/shutdown.txt, written before GBOSSYS goes read-only (a failure is appended). Proof of success is in the next boot:
 # no "Volume was not properly unmounted" in kmsg.log, and fsck.txt without "recovering journal" for GBOS_META.
-# Test hooks (tools/test_shutdown.sh): GBOS_SD_LOGDIR, GBOS_SD_PROC, GBOS_SD_MOUNTS, GBOS_SD_FDLIST, GBOS_SD_BB, GBOS_SD_KILL,
-# GBOS_SD_SYNC, GBOS_SD_KMSG, GBOS_SD_WAIT.
+# Test hooks (tools/test_shutdown.sh): GBOS_SD_LOGDIR, GBOS_SD_PROC, GBOS_SD_SYS, GBOS_SD_DEV, GBOS_SD_MOUNTS, GBOS_SD_FDLIST,
+# GBOS_SD_BB, GBOS_SD_KILL, GBOS_SD_SYNC, GBOS_SD_KMSG, GBOS_SD_WAIT.
 N=$1
 L=${GBOS_SD_LOGDIR:-/postinstall/gbos/logs/boot-$N}
 P=${GBOS_SD_PROC:-/proc}
+SYS=${GBOS_SD_SYS:-/sys}
+DEV=${GBOS_SD_DEV:-/dev}
 MOUNTS=${GBOS_SD_MOUNTS:-/proc/mounts}
 BB=${GBOS_SD_BB:-/postinstall/busybox}
 KILL=${GBOS_SD_KILL:-kill}
@@ -100,6 +107,31 @@ remount_ro() {
   else _out=$(to mount -o remount,ro "$2" 2>&1); fi
 }
 
+# "loopN file" for every loop device that is not read-only and whose image file is on GBOSSYS (as Android or stage0 sees it)
+rw_loops() {
+  for _b in $SYS/block/loop*; do
+    [ -r "$_b/loop/backing_file" ] || continue
+    _f=; read -r _f 2>/dev/null < "$_b/loop/backing_file"
+    _ro=0; read -r _ro 2>/dev/null < "$_b/ro"
+    [ "$_ro" = 1 ] && continue
+    case $_f in "$FAT"/*|/gbos/*) echo "${_b##*/} $_f";; esac
+  done
+}
+attached() { [ -r "$SYS/block/$1/loop/backing_file" ]; }
+# pids that have loop device $1 or one of its partitions open
+loop_holders() {
+  fd_list | while IFS= read -r _line; do
+    case $_line in
+      */fd:) _pid=${_line%/fd:}; _pid=${_pid##*/};;
+      *" -> /dev/block/$1"|*" -> /dev/block/$1p"[0-9]*|*" -> /dev/$1"|*" -> /dev/$1p"[0-9]*) echo "$_pid";;
+    esac
+  done
+}
+detach_loop() {
+  _n=$DEV/block/$1; [ -e "$_n" ] || _n=$DEV/$1
+  if [ -x "$BB" ]; then _out=$(to "$BB" losetup -d "$_n" 2>&1); else _out=$(to losetup -d "$_n" 2>&1); fi
+}
+
 log "shutdown.sh start: boot $N"
 fatm=$(mount_of $FAT); metam=$(mount_of /metadata)
 log "$FAT: ${fatm:-not mounted}; /metadata: ${metam:-not mounted}"
@@ -138,8 +170,22 @@ if [ "$2" = ext4 ]; then
   fi
 fi
 
-# 4. GBOSSYS. The log is complete before this; afterwards nothing more can be written there.
+# 4. writable loop images on GBOSSYS (gbos/bootdisk.img on loop6). losetup -d on a loop that is still open only marks it to be
+# detached on the last close, so whoever has it open is killed, then the image is let go of within a moment.
 set -- $fatm
+if [ -n "$1" ]; then
+  rw_loops | while read -r lo f; do
+    if ! detach_loop $lo; then log "$lo ($f): losetup -d FAILED: $_out"; continue; fi
+    if ! attached $lo; then log "$lo ($f) detached"; continue; fi
+    h=$(loop_holders $lo)
+    if [ -z "$h" ]; then log "$lo ($f) stays attached: no process has it open (a mount on it?)"; continue; fi
+    kill_pids "has $lo open ($f)" $h
+    i=0; while attached $lo && [ $i -lt 10 ]; do sleep 0.1 2>/dev/null || sleep 1; i=$((i+1)); done
+    if attached $lo; then log "$lo ($f) still attached after the kill"; else log "$lo ($f) detached"; fi
+  done
+fi
+
+# 5. GBOSSYS. The log is complete before this; afterwards nothing more can be written there.
 if [ -z "$1" ]; then
   log "$FAT not mounted: nothing to do"
   exit 0
@@ -150,7 +196,17 @@ for try in 1 2; do
   if remount_ro "$1" $FAT; then exit 0; fi
   log "$FAT remount ro FAILED (try $try): $_out"
   w=$(writers $FAT)
-  [ -z "$w" ] && { log "  no process has a file open for writing there (a loop device, e.g. gbos/metadata.img?)"; break; }
+  if [ -z "$w" ]; then
+    # every writable loop, wherever its image is (a path this script does not recognise as GBOSSYS shows up here)
+    _l=
+    for _b in $SYS/block/loop*; do
+      attached ${_b##*/} || continue
+      _ro=0; read -r _ro 2>/dev/null < "$_b/ro"; [ "$_ro" = 1 ] && continue
+      _f=; read -r _f 2>/dev/null < "$_b/loop/backing_file"; _l="$_l ${_b##*/} ($_f)"
+    done
+    log "  no process has a file open for writing there; writable loop devices:${_l:- none}"
+    break
+  fi
   echo "$w" | while read -r _p _t; do log "  writer: pid $_p ($(comm_of $_p)) $_t"; done
   [ $try = 1 ] && kill_pids "open for writing on GBOSSYS (retry)" $(echo "$w" | while read -r _p _t; do echo $_p; done)
   sleep 0.2 2>/dev/null || sleep 1

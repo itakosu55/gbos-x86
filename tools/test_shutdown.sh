@@ -2,9 +2,11 @@
 # test_shutdown.sh: runs usb/shutdown.sh against a fake /proc, a canned "ls -l /proc/*/fd" listing and stub busybox / kill / sync
 # (no Android, no root), under dash and busybox sh. Checks: only stage0's helpers (process group 0 + initramfs root) are killed, never
 # init, kernel threads, zombies or init's own children; other processes are killed only for a file open for writing on GBOSSYS; nothing
-# is killed for /metadata; /metadata is remounted before GBOSSYS, both with a device and a directory (no extra options); the log is
-# complete before GBOSSYS goes read-only; a remaining writer is reported and the power-off is not blocked; and hook.sh wires the
-# "on shutdown" action (SHUTDOWN_RO=0 turns it off) and every deploy list ships the script.
+# is killed for /metadata; /metadata is remounted before GBOSSYS, both with a device and a directory (no extra options); a writable
+# loop device whose image is on GBOSSYS (gbos/bootdisk.img on loop6) is detached before the GBOSSYS remount, and a process holding it
+# open is killed (read-only loops, loops with other images and other loops' holders are left alone; a loop held by a mount is reported);
+# the log is complete before GBOSSYS goes read-only; a remaining writer is reported and the power-off is not blocked; and hook.sh wires
+# the "on shutdown" action (SHUTDOWN_RO=0 turns it off) and every deploy list ships the script.
 HERE=$(cd "$(dirname "$0")" && pwd); ROOT=$HERE/..
 S=$ROOT/usb/shutdown.sh; H=$ROOT/usb/hook.sh
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -24,14 +26,34 @@ for p in "$@"; do
   rm -rf "$FAKE_T/proc/$p"
   awk -v p="$p" '/\/fd:$/ { skip = ($0 ~ ("/" p "/fd:$")) } !skip' "$FAKE_T/fdlist" > "$FAKE_T/fdlist.n" && mv "$FAKE_T/fdlist.n" "$FAKE_T/fdlist"
 done
+# a loop marked by losetup -d is detached on its last close (never while a mount holds it)
+for b in "$FAKE_T"/sys/block/loop*; do
+  [ -e "$b/pending" ] && ! [ -e "$b/mounted" ] || continue
+  n=${b##*/}
+  grep -q -E " -> /dev(/block)?/$n(p[0-9]+)?\$" "$FAKE_T/fdlist" || rm -rf "$b/loop" "$b/pending"
+done
 EOF
-# busybox mount -o remount,ro DEV DIR: EBUSY while the listing still has a file open for writing below DIR
+# busybox losetup -d DEV: detached now if nobody has it open, else only marked (the kernel detaches it on the last close).
+# busybox mount -o remount,ro DEV DIR: EBUSY while the listing still has a file open for writing below DIR, or (GBOSSYS) while a
+# writable loop with its image there is attached
 cat > $T/bin/bb <<'EOF'
 #!/bin/sh
+if [ "$1" = losetup ]; then
+  echo "$*" >> "$FAKE_T/losetup"; n=${3##*/}; b=$FAKE_T/sys/block/$n
+  if [ -e "$b/mounted" ] || grep -q -E " -> /dev(/block)?/$n(p[0-9]+)?\$" "$FAKE_T/fdlist"; then touch "$b/pending"; else rm -rf "$b/loop"; fi
+  exit 0
+fi
 echo "$@" >> "$FAKE_T/bb"
 d=$5
 [ "$d" = /postinstall ] && pat=' -> (/postinstall|/gbos)/' || pat=" -> $d/"
-if grep -E '^l.w' "$FAKE_T/fdlist" | grep -q -E "$pat"; then echo "mount: mounting $4 on $d failed: Device or resource busy" >&2; exit 1; fi
+busy=
+grep -E '^l.w' "$FAKE_T/fdlist" | grep -q -E "$pat" && busy=1
+if [ "$d" = /postinstall ]; then
+  for b in "$FAKE_T"/sys/block/loop*; do
+    [ -r "$b/loop/backing_file" ] && [ "$(cat "$b/ro")" = 0 ] && grep -q -E '^(/gbos|/postinstall)/' "$b/loop/backing_file" && busy=1
+  done
+fi
+[ -n "$busy" ] && { echo "mount: mounting $4 on $d failed: Device or resource busy" >&2; exit 1; }
 echo remounted >> "$FAKE_T/log/shutdown.txt.after"
 EOF
 printf '#!/bin/sh\necho sync >> "$FAKE_T/syncs"\n' > $T/bin/sync
@@ -44,8 +66,20 @@ mkproc() {
   echo "$6" > $T/proc/$1/comm
   case $5 in new) ln -s $T/newroot $T/proc/$1/root;; old) ln -s $T/oldroot $T/proc/$1/root;; esac
 }
+# loopN ro image ("" = not attached)
+mkloop() {
+  mkdir -p $T/sys/block/$1; echo $2 > $T/sys/block/$1/ro
+  [ -n "$3" ] && { mkdir -p $T/sys/block/$1/loop; echo "$3" > $T/sys/block/$1/loop/backing_file; }
+}
 setup() {
-  rm -rf $T/proc $T/kills $T/bb $T/syncs $T/log/*
+  rm -rf $T/proc $T/sys $T/dev $T/kills $T/bb $T/losetup $T/syncs $T/log/*
+  mkloop loop6 0 /gbos/gbos/bootdisk.img                # hook.sh's boot disk (misc, vbmeta_a/b): writable, on GBOSSYS
+  mkloop loop7 1 /gbos/gbos/super.img                   # losetup -r: read-only
+  mkloop loop8 0 /data/apex/com.example.apex            # writable but not on GBOSSYS
+  mkloop loop9 0 ""                                     # not attached
+  mkdir -p $T/dev/block && : > $T/dev/block/loop6
+  mkproc 4000920 S 1       4000920 new android.hardwar   # has loop6p1 (misc) open
+  mkproc 4000921 S 1       4000921 new other             # has loop60 open: not loop6
   mkproc 1       S 0       0       new init
   mkproc 2       S 0       0       old kthreadd
   mkproc 4000030 I 2       0       old kworker/0:1       # kernel thread: initramfs root, pgrp 0, but a child of kthreadd
@@ -71,13 +105,19 @@ lrwx------ 1 root root 64 2026-11-17 14:54 4 -> /data/misc/x
 
 /proc/4000905/fd:
 lr-x------ 1 root root 64 2026-11-17 14:54 5 -> /postinstall/gbos/super.img
+
+/proc/4000920/fd:
+lrwx------ 1 root root 64 2026-11-17 14:54 6 -> /dev/block/loop6p1
+
+/proc/4000921/fd:
+lrwx------ 1 root root 64 2026-11-17 14:54 6 -> /dev/block/loop60
 EOF
   cat > $T/mounts <<EOF
 /dev/nvme0n1p7 /postinstall vfat rw,relatime,fmask=0000,dmask=0000,codepage=437,shortname=mixed,errors=remount-ro 0 0
 /dev/nvme0n1p8 /metadata ext4 rw,seclabel,nosuid,nodev,noatime 0 0
 EOF
 }
-export FAKE_T=$T GBOS_SD_LOGDIR=$T/log GBOS_SD_PROC=$T/proc GBOS_SD_MOUNTS=$T/mounts GBOS_SD_FDLIST=$T/fdlist \
+export FAKE_T=$T GBOS_SD_LOGDIR=$T/log GBOS_SD_PROC=$T/proc GBOS_SD_SYS=$T/sys GBOS_SD_DEV=$T/dev GBOS_SD_MOUNTS=$T/mounts GBOS_SD_FDLIST=$T/fdlist \
        GBOS_SD_BB=$T/bin/bb GBOS_SD_KILL=$T/bin/kill GBOS_SD_SYNC=$T/bin/sync GBOS_SD_KMSG=$T/kmsg GBOS_SD_WAIT=0
 LOG=$T/log/shutdown.txt
 killed() { tr ' ' '\n' < $T/kills 2>/dev/null | grep -qx "$1"; }
@@ -91,7 +131,7 @@ for SH in dash "busybox sh"; do
   $SH $S 9 >/dev/null 2>&1; rc=$?
   [ $rc = 0 ] && ok "exit 0" || bad "exit $rc"
   for p in 4000242 4000245 4001217 4000903; do killed $p && ok "stage0 helper $p killed" || bad "stage0 helper $p not killed"; done
-  for p in 1 2 4000030 4000300 4000301 4000302 4000905 4000910; do killed $p && bad "$p killed" || ok "$p kept"; done
+  for p in 1 2 4000030 4000300 4000301 4000302 4000905 4000910 4000921; do killed $p && bad "$p killed" || ok "$p kept"; done
   killed 4000900 && ok "a gbos service still writing to GBOSSYS is killed" || bad "writer 4000900 not killed"
   grep -q 'kill 4000903 (a) b (c): stage0 helper' $LOG && ok "a name with ') ' is parsed and logged" || bad "odd name: $(grep 4000903 $LOG)"
   [ "$(sed -n 1p $T/bb)" = "mount -o remount,ro /dev/nvme0n1p8 /metadata" ] && ok "/metadata first, as remount,ro DEV DIR" || bad "first remount: $(sed -n 1p $T/bb)"
@@ -101,6 +141,14 @@ for SH in dash "busybox sh"; do
   tail -1 $LOG | grep -q 'this log ends here' && ok "log complete before GBOSSYS goes read-only (last line)" || bad "last log line: $(tail -1 $LOG)"
   [ "$(wc -l < $T/syncs | tr -d ' ')" -ge 2 ] && ok "synced before the remounts" || bad "syncs: $(cat $T/syncs 2>&1)"
   grep -q 'gbos-shutdown: shutdown.sh start' $T/kmsg && ok "also logs to kmsg" || bad "no kmsg lines"
+  [ "$(cat $T/losetup 2>&1)" = "losetup -d $T/dev/block/loop6" ] && ok "only loop6 (writable, image on GBOSSYS) is detached, by its /dev/block node" \
+    || bad "losetup calls: $(cat $T/losetup 2>&1)"
+  killed 4000920 && ok "the process holding loop6p1 is killed" || bad "loop6 holder not killed"
+  grep -q 'kill 4000920 (android.hardwar): has loop6 open (/gbos/gbos/bootdisk.img)' $LOG && grep -q 'loop6 (/gbos/gbos/bootdisk.img) detached' $LOG \
+    && ok "the holder and the detach are logged" || bad "loop log: $(cat $LOG)"
+  a=$(grep -n '/metadata (/dev/nvme0n1p8) remounted' $LOG | cut -d: -f1); b=$(grep -n 'loop6 .* detached' $LOG | cut -d: -f1)
+  c=$(grep -n 'this log ends here' $LOG | cut -d: -f1)
+  [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] && [ "$a" -lt "$b" ] && [ "$b" -lt "$c" ] && ok "order: /metadata, loop detach, GBOSSYS" || bad "order: $a $b $c"
 
   # 2. init itself still writes to GBOSSYS: never killed, remount fails, reported, power-off not blocked
   setup
@@ -127,25 +175,23 @@ for SH in dash "busybox sh"; do
   grep -q /metadata $T/bb && bad "tmpfs /metadata remounted" || ok "tmpfs /metadata left alone"
   grep -q 'remount,ro /dev/sdb2 /postinstall' $T/bb && ok "stick remounted read-only" || bad "stick: $(cat $T/bb)"
 
-  # 5. a loop device (gbos/metadata.img) keeps GBOSSYS busy with no process holding it: reported, no kill spree
+  # 5. gbos/metadata.img under /metadata: the mount keeps the loop open, no process does. Reported, one try, nothing killed for it.
   setup
-  cat > $T/bin/bb <<'EOF'
-#!/bin/sh
-echo "$@" >> "$FAKE_T/bb"; [ "$5" = /postinstall ] && { echo "Device or resource busy" >&2; exit 1; }; exit 0
-EOF
-  chmod +x $T/bin/bb
+  rm -rf $T/sys/block/loop6/loop
+  mkloop loop12 0 /gbos/gbos/metadata.img; touch $T/sys/block/loop12/mounted
   $SH $S 9 >/dev/null 2>&1; rc=$?
-  [ $rc = 0 ] && grep -q 'no process has a file open for writing there' $LOG && [ "$(grep -c 'remount,ro /dev/nvme0n1p7' $T/bb)" = 1 ] \
-    && ok "busy with no writer: one try, reason logged" || bad "loop case: rc=$rc $(cat $LOG)"
-  cat > $T/bin/bb <<'EOF'
-#!/bin/sh
-echo "$@" >> "$FAKE_T/bb"
-d=$5
-[ "$d" = /postinstall ] && pat=' -> (/postinstall|/gbos)/' || pat=" -> $d/"
-if grep -E '^l.w' "$FAKE_T/fdlist" | grep -q -E "$pat"; then echo "mount: mounting $4 on $d failed: Device or resource busy" >&2; exit 1; fi
-echo remounted >> "$FAKE_T/log/shutdown.txt.after"
-EOF
-  chmod +x $T/bin/bb
+  [ $rc = 0 ] && grep -q 'loop12 (/gbos/gbos/metadata.img) stays attached: no process has it open' $LOG \
+    && grep -q 'writable loop devices:.* loop12 (/gbos/gbos/metadata.img)' $LOG && [ "$(grep -c 'remount,ro /dev/nvme0n1p7' $T/bb)" = 1 ] \
+    && ok "loop under a mount: one try, the loop is named" || bad "loop under a mount: rc=$rc $(cat $LOG)"
+  killed 4000920 && bad "loop6p1 holder killed with loop6 not attached" || ok "a loop holder is killed only for an attached writable loop"
+
+  # 7. nobody has the loop open, image path as Android sees it: detached at once, nothing killed for it, GBOSSYS read-only
+  setup
+  echo /postinstall/gbos/bootdisk.img > $T/sys/block/loop6/loop/backing_file
+  awk '/\/fd:$/ { skip = ($0 ~ "/4000920/fd:$") } !skip' $T/fdlist > $T/fdlist.n && mv $T/fdlist.n $T/fdlist
+  $SH $S 9 >/dev/null 2>&1
+  grep -q 'loop6 (/postinstall/gbos/bootdisk.img) detached' $LOG && ! grep -q 'has loop6 open' $LOG && [ -s $T/log/shutdown.txt.after ] \
+    && ok "an unused loop is detached at once (Android path), GBOSSYS read-only" || bad "unused loop: $(cat $LOG)"
 done
 
 # 6. hook.sh: the "on shutdown" action, generated the way hook.sh does it
