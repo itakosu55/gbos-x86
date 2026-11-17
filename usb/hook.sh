@@ -367,6 +367,16 @@ if mount --bind /gbos /new/postinstall; then
   # a Surface), so on any other laptop it exited at once and init restarted it every 5 s for as long as the system ran.
   if grep -qi 'Surface' /sys/class/dmi/id/product_name 2>/dev/null; then SURFACESTART="start gbos_camera
     start gbos_sleep_guard"; else SURFACESTART="# gbos: not a Surface, camera bridge and sleep guard not started"; fi
+  # Power off / reboot: init's own shutdown only unmounts /dev/block/* mounts, so GBOSSYS (this FAT, /postinstall) and /metadata stayed
+  # read-write until the power went (FAT dirty and /metadata journal replayed on every boot). shutdown.sh stops what writes there and
+  # remounts both read-only. SHUTDOWN_RO=0 in gbos.cfg keeps the old behaviour, so that kmsg.log covers init's whole shutdown.
+  if [ "${SHUTDOWN_RO:-1}" != 0 ] && [ -f $G/shutdown.sh ]; then SHUTDOWNRC="on shutdown
+    stop gbos_logcat
+    stop gbos_crashlog
+    stop gbos_sync
+    stop gbos_nativezygote
+    exec u:r:shell:s0 root root -- /system/bin/sh /postinstall/gbos/shutdown.sh $N"
+  else SHUTDOWNRC="# gbos: GBOSSYS and /metadata stay read-write at shutdown (SHUTDOWN_RO=0, or no gbos/shutdown.sh)"; fi
   IDCRC=
   if [ "${TOUCHPAD_FLICK:-1}" != 0 ]; then
     for tp in $(gbos_touchpads); do
@@ -640,6 +650,8 @@ on post-fs-data
     start gbos_crashlog
     # KernelSU: the daemon has to be in /data/adb before the kernel's own init.rc runs it.
     start gbos_ksu
+
+$SHUTDOWNRC
 RC
   # Conscrypt (and identical) APEX libcrypto: the APEX is signed, so patch a copy and bind it over the
   # original once apexd has activated every APEX (init.rc's "wait_for_prop apexd.status activated" is in
