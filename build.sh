@@ -16,7 +16,7 @@
 #   3. Kernel modules (14 MB), firmware (70 MB) and the SwiftShader software Vulkan driver (AMD GPUs; 6 MB) built from this
 #      repo's sources, from the GitHub release.
 #   4. Assembles the flashable image with tools/make_gbos86_image.sh (the kernel, patched libraries and installer
-#      tools are already in this repository).
+#      tools are already in this repository); the kernel is signed for Secure Boot with your own key (README "Secure Boot").
 # Needs: macOS or Linux, docker (running), python3, curl, tar, xz, ~35 GB free disk.
 set -e
 cd "$(dirname "$0")"

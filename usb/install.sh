@@ -2,7 +2,7 @@
 # MODE=install), after the stick is mounted at /gbos ($G=/gbos/gbos, log dir $L, stick partition $DEV) and drivers loaded.
 #
 # ERASES THE WHOLE TARGET DISK and lays it out as:
-#   p1 GBOS_EFI   512 MiB FAT32, EFI system partition: EFI/BOOT/BOOTX64.EFI (this kernel + stage0)
+#   p1 GBOS_EFI   512 MiB FAT32, EFI system partition: EFI/BOOT/ = the stick's boot files (shim + this kernel signed, or the kernel alone)
 #   p2 GBOSSYS      8 GiB FAT32: gbos/ as on the stick (super.img, hook.sh, firmware, ...)
 #   p3 GBOS_META   64 MiB ext4: Android /metadata
 #   p4 GBOS_DATA   rest   ext4: Android /data
@@ -46,6 +46,30 @@ ask() { printf '%s' "$1" > $TTY; read -r REPLY < $TTY; echo "$1$REPLY" >> $L/ins
 # faster than hashing both files with busybox's software sha256 (that took minutes for the 5 GB system image).
 check() { cmp -s "$1" "$2" || die "verify failed: $2"; echo "ok $2" >> $L/install.log; }
 
+# The boot files in DIR: EFI/BOOT on our own EFI partition, EFI/gbos86 on a shared one. With shim (Secure Boot) the kernel is
+# DIR/grubx64.efi and shim is DIR/BOOTX64.EFI, so the UEFI boot entry, the firmware's fallback path and the Windows boot menu entry,
+# which all start DIR/BOOTX64.EFI, start shim. boot_layout DIR [keep] sets KDST, the kernel's file: grubx64.efi when DIR already has
+# that layout or the stick brings shim, else BOOTX64.EFI. "keep": an install there that boots the kernel as BOOTX64.EFI stays that way
+# (dual-boot: GRUB entries on the other system name EFI/gbos86/BOOTX64.EFI); it gets the stick's kernel, signed or not.
+boot_layout() {
+  KDST=$1/BOOTX64.EFI
+  if [ -f $1/grubx64.efi ]; then KDST=$1/grubx64.efi
+  elif [ -n "$SB" ] && { [ "$2" != keep ] || ! is_kernel $1/BOOTX64.EFI; }; then KDST=$1/grubx64.efi; fi
+}
+# put_boot DIR: copy what differs, the kernel first (until shim replaces an older kernel as BOOTX64.EFI, that one still boots).
+put_boot() {
+  cmp -s $KERNEL $KDST || { say "  kernel (${KDST#/mnt/nefi/})"; cp $KERNEL $KDST || return 1; }
+  [ -n "$SB" ] && [ "$KDST" = $1/grubx64.efi ] || return 0
+  for f in mmx64.efi gbos86-mok.cer BOOTX64.EFI; do
+    cmp -s $SB/$f $1/$f || { say "  ${1#/mnt/nefi/}/$f$([ $f = BOOTX64.EFI ] && echo ' (shim)')"; cp $SB/$f $1/$f || return 1; }
+  done
+}
+check_boot() {
+  check $KERNEL $KDST
+  [ -n "$SB" ] && [ "$KDST" = $1/grubx64.efi ] || return 0
+  for f in mmx64.efi gbos86-mok.cer BOOTX64.EFI; do check $SB/$f $1/$f; done
+}
+
 # Big items (system image, firmware, modules) are skipped on update when nothing about them changed since the last VERIFIED copy.
 # A "stamp" is a hash of an item's file names, sizes and modification times on the stick. It is saved on the SSD (gbos/.stamps/) only
 # after the copy was verified, so the next update compares two short strings instead of reading ~5.5 GB twice and re-copying ~400 MB.
@@ -80,13 +104,32 @@ EFIPART=$(tool sfdisk -d /dev/$STICKDISK 2>/dev/null | awk 'toupper($0) ~ /TYPE=
 [ -b "$EFIPART" ] || EFIPART=/dev/$(ls /sys/class/block/$STICKDISK | grep -m1 "^${STICKDISK}p\?1$")
 mkdir -p /mnt/stickefi && mount -t vfat -o ro $EFIPART /mnt/stickefi 2>/dev/null \
   || die "cannot mount the stick's EFI partition ($EFIPART)"
-KERNEL=""
-for k in /mnt/stickefi/EFI/gbos/BOOTX64.EFI /mnt/stickefi/EFI/gbos86/BOOTX64.EFI /mnt/stickefi/EFI/BOOT/BOOTX64.EFI /gbos/EFI/BOOT/BOOTX64.EFI $G/../EFI/BOOT/BOOTX64.EFI; do
-  [ -f "$k" ] && KERNEL="$k" && break
-done
-[ -f "$KERNEL" ] || die "missing EFI/BOOT/BOOTX64.EFI on the stick's EFI partition"
-# Cache the kernel in RAM and unmount the EFI partition so it does not keep the target disk busy
-mkdir -p /tmp && cp "$KERNEL" /tmp/BOOTX64.EFI && KERNEL=/tmp/BOOTX64.EFI
+# The boot files. A Secure Boot stick (tools/secureboot.py) has BOOTX64.EFI = shim, grubx64.efi = this kernel signed with the builder's
+# key, mmx64.efi = MokManager and gbos86-mok.cer = that key; an older stick has the kernel itself as BOOTX64.EFI.
+# find_boot DIR...: in the first DIR with a kernel, set KERNEL, and SBDIR when shim, MokManager and the key are there too. A kernel as
+# BOOTX64.EFI wins over grubx64.efi: that is what the firmware started (a new kernel copied over shim by hand, Secure Boot off).
+is_kernel() { [ "$(dd if="$1" bs=1 skip=514 count=4 2>/dev/null)" = HdrS ]; }
+find_boot() {
+  KERNEL=""; SBDIR=""
+  for d in "$@"; do
+    is_kernel $d/BOOTX64.EFI && { KERNEL=$d/BOOTX64.EFI; return; }
+    if is_kernel $d/grubx64.efi; then
+      KERNEL=$d/grubx64.efi
+      [ -f $d/BOOTX64.EFI ] && [ -f $d/mmx64.efi ] && [ -f $d/gbos86-mok.cer ] && SBDIR=$d
+      return
+    fi
+  done
+}
+find_boot /mnt/stickefi/EFI/gbos /mnt/stickefi/EFI/gbos86 /mnt/stickefi/EFI/BOOT /gbos/EFI/BOOT $G/../EFI/BOOT
+[ -f "$KERNEL" ] || die "no kernel on the stick's EFI partition (EFI/BOOT/BOOTX64.EFI or EFI/BOOT/grubx64.efi)"
+# Cache them in RAM and unmount the EFI partition so it does not keep the target disk busy
+mkdir -p /tmp/boot && cp "$KERNEL" /tmp/boot/kernel || die "cannot read $KERNEL"
+KERNEL=/tmp/boot/kernel; SB=""
+if [ -n "$SBDIR" ]; then
+  mkdir -p /tmp/boot/sb && cp $SBDIR/BOOTX64.EFI $SBDIR/mmx64.efi $SBDIR/gbos86-mok.cer /tmp/boot/sb/ || die "cannot read the Secure Boot files in $SBDIR"
+  SB=/tmp/boot/sb
+fi
+log "install: kernel from $([ -n "$SBDIR" ] && echo "$SBDIR (shim layout)" || echo "${KERNEL%/*}")"
 umount /mnt/stickefi 2>/dev/null || true
 FILES="super.img super.layout hook.sh aidiag.sh native_zygote.sh early_patch.sh hwdetect.sh apex_patch.sh crossystem bootdisk.img libkm_compat.so system_ext_manifest.xml soft_gk"
 DIRS="firmware patched audio installer kmod modules surface ksu"
@@ -162,16 +205,13 @@ if [ "${ACTION:-install}" = update ]; then
     case " $STAMPED " in *" $d "*) if stamp_same $d; then SKIP="$SKIP $d"; say "  $d/ unchanged, skipped"; continue; fi;; esac
     say "  $d/"; rm -rf /mnt/nsys/gbos/$d; (cd "$G" && tar -cf - "$d") | (cd /mnt/nsys/gbos && tar -xf -) || cp -r "$G/$d" /mnt/nsys/gbos/ || die "copy $d/ failed"
   done
-  if [ $SHARED_EFI = 1 ]; then
-    cmp -s $KERNEL /mnt/nefi/EFI/gbos86/BOOTX64.EFI || { say "  kernel (EFI/gbos86)"; cp $KERNEL /mnt/nefi/EFI/gbos86/BOOTX64.EFI || die "copy kernel failed"; }
-  else
-    cmp -s $KERNEL /mnt/nefi/EFI/BOOT/BOOTX64.EFI || { say "  kernel"; cp $KERNEL /mnt/nefi/EFI/BOOT/BOOTX64.EFI || die "copy kernel failed"; }
-  fi
+  if [ $SHARED_EFI = 1 ]; then BOOTDIR=/mnt/nefi/EFI/gbos86; boot_layout $BOOTDIR keep; else BOOTDIR=/mnt/nefi/EFI/BOOT; boot_layout $BOOTDIR; fi
+  put_boot $BOOTDIR || die "copying the boot files to ${BOOTDIR#/mnt/nefi/} failed"
   # Settings such as DENSITY follow the stick; the installed copy always boots normally.
   write_installed_cfg
   sync; echo 3 > /proc/sys/vm/drop_caches
   say "Verifying ..."
-  if [ $SHARED_EFI = 1 ]; then check $KERNEL /mnt/nefi/EFI/gbos86/BOOTX64.EFI; else check $KERNEL /mnt/nefi/EFI/BOOT/BOOTX64.EFI; fi
+  check_boot $BOOTDIR
   for f in $FILES; do is_skipped $f || check $G/$f /mnt/nsys/gbos/$f; done
   for d in $DIRS; do is_skipped $d && continue; (cd $G && find $d -type f) | while read f; do check $G/$f /mnt/nsys/gbos/$f; done || exit 1; done || die "verify failed"
   for i in $STAMPED; do stamp_save $i || say "  (could not save the update stamp for $i; the next update will do a full compare)"; done
@@ -445,7 +485,7 @@ else
   [ $free_mb -ge 17000 ] || die "only about $(( free_mb / 1024 )) GB of unallocated space on $TD; dual-boot needs 17 GB (8 GB system + 8 GB data at least). Shrink a partition in Windows/Linux first."
 
   say "This will add two partitions in the unallocated space (about $(( free_mb / 1024 )) GB): GBOSSYS (8 GiB) and GBOS_DATA (the rest)."
-  say "Nothing existing is erased or reformatted. The kernel goes to $TARGET_EFI as EFI/gbos86/BOOTX64.EFI (no other file there is touched)."
+  say "Nothing existing is erased or reformatted. The boot files go to $TARGET_EFI in EFI/gbos86/ (no other file there is touched)."
   say "To continue, type the serial number ($SERIAL) or 'yes' to proceed. Anything else cancels."
   CONFIRM=$(sed -n 's/.*gbos_install_confirm=\([^ ]*\).*/\1/p' /proc/cmdline)
   if [ -n "$CONFIRM" ]; then
@@ -534,15 +574,14 @@ copy_large_file() {
 }
 
 say "Copying the kernel ..."
+# The fallback path EFI/BOOT/ belongs to the machine's other OS on a shared EFI partition: only a clean install owns it.
 if [ "$INSTALL_MODE" = dualboot ]; then
-  mkdir -p /mnt/nefi/EFI/gbos86
-  cp $KERNEL /mnt/nefi/EFI/gbos86/BOOTX64.EFI || die "copy BOOTX64.EFI failed"
-  [ -f "$G/Add-gbOS-to-Windows-BootMenu.bat" ] && cp "$G/Add-gbOS-to-Windows-BootMenu.bat" /mnt/nefi/EFI/gbos86/ 2>/dev/null || true
+  BOOTDIR=/mnt/nefi/EFI/gbos86; mkdir -p $BOOTDIR; boot_layout $BOOTDIR keep
+  [ -f "$G/Add-gbOS-to-Windows-BootMenu.bat" ] && cp "$G/Add-gbOS-to-Windows-BootMenu.bat" $BOOTDIR/ 2>/dev/null || true
+else
+  BOOTDIR=/mnt/nefi/EFI/BOOT; boot_layout $BOOTDIR
 fi
-# The fallback path EFI/BOOT/BOOTX64.EFI belongs to the machine's other OS on a shared EFI partition: only a clean install owns it.
-if [ "$INSTALL_MODE" = clean ]; then
-  cp $KERNEL /mnt/nefi/EFI/BOOT/BOOTX64.EFI || die "copy BOOTX64.EFI failed"
-fi
+put_boot $BOOTDIR || die "copying the boot files to ${BOOTDIR#/mnt/nefi/} failed"
 
 say "Copying system image (super.img) ..."
 copy_large_file "$G/super.img" "/mnt/nsys/gbos/super.img" "System Image"
@@ -599,7 +638,7 @@ write_installed_cfg
 sync; echo 3 > /proc/sys/vm/drop_caches
 
 say "Verifying installation integrity ..."
-if [ "$INSTALL_MODE" = dualboot ]; then check $KERNEL /mnt/nefi/EFI/gbos86/BOOTX64.EFI; else check $KERNEL /mnt/nefi/EFI/BOOT/BOOTX64.EFI; fi
+check_boot $BOOTDIR
 for f in $FILES; do
   if [ "$f" = "super.img" ]; then
     _sz_src=$(stat -c %s "$G/super.img" 2>/dev/null || echo 0)
@@ -659,7 +698,7 @@ menuentry \"Googlebook OS (gbOS86)\" --class android --class os {
     insmod part_gpt
     insmod fat
     search --no-floppy --fs-uuid --set=root $_esp_uuid
-    linux /EFI/gbos86/BOOTX64.EFI ibt=off i8042.nopnp androidboot.setupwizard.mode=DISABLED usbcore.autosuspend=-1
+    linux /EFI/gbos86/${KDST##*/} ibt=off i8042.nopnp androidboot.setupwizard.mode=DISABLED usbcore.autosuspend=-1
 }"
       _added=0
       _custom_sourced=0
@@ -716,6 +755,7 @@ else
   say " gbOS86 is successfully installed on $TD!"
   say " Press your boot key (F12 / F9 / Esc) at the logo to select gbOS86."
 fi
+[ "$KDST" = $BOOTDIR/grubx64.efi ] && [ -n "$SB" ] && say " Secure Boot can stay on: the first boot with it asks once to enroll the gbOS86 key."
 say "=============================================================="
 log "install: complete"; sync
 say ""
