@@ -376,6 +376,19 @@ When installing onto a drive with existing operating systems (Windows or Linux),
 
 During installation, live progress bars indicate system image and driver/firmware copying, followed by fast sha256 verification.
 
+#### Dual-boot install from a running Linux (no stick)
+On a machine that already runs Linux, `build.sh` can install into the disk's unallocated space directly:
+```sh
+./build.sh --dualboot --target /dev/nvme0n1 --allow-internal --allow-root --sys-size 8G --data-size rest
+```
+It downloads and builds as usual, then runs `sudo tools/install_dualboot.sh`, which adds `GBOSSYS`, `GBOS_META` and `GBOS_DATA`
+back to back in the largest free block (`--data-size rest` = all of what is left), copies the kernel to the existing EFI partition
+as `EFI/gbos86/BOOTX64.EFI` (nothing else there is touched), adds a GRUB entry (left alone when a working one exists; an older,
+broken one is reported, not edited) and a UEFI boot entry appended to BootOrder (`--boot-first` puts it first, `--no-nvram` /
+`--no-grub` skip either). Everything is checked before the first write and partitioning asks for the disk's serial. Running the
+same command again only updates the files (no format unless `--reformat`, which also asks for the serial). Preview with
+`sudo sh tools/install_dualboot.sh --target ... --dry-run`. `sudo sh tools/test_install_dualboot.sh` tests it on a loop device.
+
 ### Secure Boot
 Secure Boot can stay on, with a kernel built from kernel #47 on (its `.sbat` section comes from `kernel/sbat.csv`). Tested in QEMU/OVMF
 with Microsoft's keys; **not yet tested on a laptop.** The firmware trusts Microsoft's UEFI CA, which signed **shim** (Ubuntu's build,

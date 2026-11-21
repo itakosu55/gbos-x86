@@ -6,6 +6,7 @@
 #   ./build.sh --looper            -> dist/gbOS86-looper-YYYYMMDD.img (persistent /data, MODE=boot)
 #   ./build.sh --looper --data-size 32
 #   ./build.sh --dualboot --target /dev/sda -> install directly to disk alongside existing Windows/Linux
+#     (also --sys-size 8G, --data-size rest, --no-nvram, --no-grub, --boot-first: see tools/install_dualboot.sh --help)
 #   ./build.sh -y                  don't ask before downloading (uses standard if not specified)
 #   ./build.sh --dry-run           show what would be downloaded and built, change nothing
 #
@@ -42,9 +43,12 @@ while [ $# -gt 0 ]; do
     --allow-internal) EXTRA_FLAGS="$EXTRA_FLAGS --allow-internal";;
     --allow-root) EXTRA_FLAGS="$EXTRA_FLAGS --allow-root";;
     --reformat) EXTRA_FLAGS="$EXTRA_FLAGS --reformat";;
+    --no-nvram|--no-grub|--boot-first) EXTRA_FLAGS="$EXTRA_FLAGS $1";;
+    --sys-size) shift; EXTRA_FLAGS="$EXTRA_FLAGS --sys-size $1";;
+    --sys-size=*) EXTRA_FLAGS="$EXTRA_FLAGS --sys-size ${1#*=}";;
     --data-size) shift; DATA_GB="$1";;
     --data-size=*) DATA_GB="${1#*=}";;
-    -h|--help) sed -n '2,18p' "$0"; exit 0;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0;;
     *) echo "Unknown option: $1"; exit 1;;
   esac
   shift
@@ -265,7 +269,8 @@ if [ "$BUILD_TYPE" = "dualboot" ]; then
   [ $DRY -eq 1 ] && EXTRA_FLAGS="$EXTRA_FLAGS --dry-run"
   [ "$AUTO_TAILOR" = 1 ] && EXTRA_FLAGS="$EXTRA_FLAGS --auto"
   [ "$(uname -s)" = Linux ] || die "--dualboot partitions a disk with Linux tools (sgdisk, lsblk): run it from Linux"
-  sudo sh tools/install_dualboot.sh --target "$TARGET_DISK" --data-size "${DATA_GB}G" $EXTRA_FLAGS
+  case "$DATA_GB" in *[!0-9]*) DATA_ARG=$DATA_GB;; *) DATA_ARG=${DATA_GB}G;; esac   # "rest" = the rest of the free space
+  sudo sh tools/install_dualboot.sh --target "$TARGET_DISK" --data-size "$DATA_ARG" $EXTRA_FLAGS
 else
   say "4/4 building the image ($BUILD_TYPE)"
   MAKE_FLAGS="--type $BUILD_TYPE --data-size $DATA_GB"

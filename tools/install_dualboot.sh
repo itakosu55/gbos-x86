@@ -1,6 +1,10 @@
 #!/bin/sh
-# tools/install_dualboot.sh: Automated, Non-Destructive Persistent Dual-Boot Installer for gbOS86
-# Installs gbOS86 on a target disk alongside existing Windows and Linux (Ubuntu) installations.
+# tools/install_dualboot.sh: non-destructive dual-boot install of gbOS86 from a running Linux (no stick needed).
+# Adds GBOSSYS (FAT32), GBOS_META (ext4) and GBOS_DATA (ext4) in the largest unallocated block of the target disk, puts
+# the kernel in the disk's existing EFI system partition as EFI/gbos86/BOOTX64.EFI (nothing else there is touched), and adds a
+# GRUB entry and a UEFI boot entry (appended to BootOrder: the current boot order is kept).
+# Re-running it on a disk that already has the partitions only updates the files: nothing is formatted unless --reformat.
+# Everything is checked before the first write; partitioning or formatting asks for the disk's serial number.
 # Usage: sudo tools/install_dualboot.sh --target /dev/sdX [options]
 
 set -e
@@ -14,13 +18,19 @@ META_SIZE="64M"
 DATA_SIZE="64G"
 REFORMAT=0
 DRY_RUN=0
-SKIP_DOWNLOAD=0
 AUTO_TAILOR=0
-
 ALLOW_INTERNAL=0
 ALLOW_ROOT=0
+DO_NVRAM=1
+BOOT_FIRST=0
+DO_GRUB=1
+GRUB_ROOT=/
+MIN_DATA_MIB=4096
+GRUB_LABEL="Googlebook OS (gbOS86)"
+GRUB_ARGS="ibt=off i8042.nopnp androidboot.setupwizard.mode=DISABLED usbcore.autosuspend=-1"   # the same entry as usb/install.sh writes
 
 say() { printf '\n== %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 usage() {
@@ -28,19 +38,23 @@ usage() {
 Usage: sudo $0 --target <disk> [options]
 
 Options:
-  --target <disk>        Target disk device (e.g. /dev/sda, /dev/sdb). REQUIRED.
-  --efi-part <part>      EFI partition to use (default: auto-detected, e.g. /dev/sda2).
-  --sys-size <size>      Size of GBOSSYS partition (default: 10G).
-  --meta-size <size>     Size of GBOS_META partition (default: 64M).
-  --data-size <size>     Size of GBOS_DATA partition (default: 64G).
-  --reformat             Re-format existing gbOS86 partitions.
-  --allow-internal       Allow targeting internal NVMe drives (/dev/nvme*).
-  --allow-root           Allow targeting the disk holding the active root filesystem.
-  --dry-run              Simulate operations without writing changes.
+  --target <disk>        Target disk device (e.g. /dev/sda, /dev/nvme0n1). REQUIRED.
+  --efi-part <part>      EFI system partition to use (default: the EFI-type partition of the target disk).
+  --sys-size <size>      Size of GBOSSYS (default: 10G). K/M/G/T are binary units; a bare number is GiB.
+  --meta-size <size>     Size of GBOS_META (default: 64M).
+  --data-size <size>     Size of GBOS_DATA (default: 64G), or "rest" for the rest of the free block.
+  --reformat             Re-format existing gbOS86 partitions (erases gbOS86's /data; asks for the serial).
+  --allow-internal       Allow targeting internal drives (NVMe, fixed SATA).
+  --allow-root           Allow targeting the disk holding the running root filesystem.
+  --no-nvram             Do not add a UEFI boot entry (efibootmgr).
+  --boot-first           Put the new UEFI boot entry first in BootOrder (default: append it, keeping the current order).
+  --no-grub              Do not add a GRUB menu entry.
+  --grub-root <dir>      The root of the Linux whose GRUB gets the entry (default: /). update-grub only runs for /.
+  --dry-run              Show what would be done; write nothing.
   -h, --help             Show this help message.
 
 Example:
-  sudo $0 --target /dev/sda
+  sudo $0 --target /dev/nvme0n1 --allow-internal --allow-root --sys-size 8G --data-size rest
 EOF
   exit "${1:-1}"
 }
@@ -55,6 +69,10 @@ while [ $# -gt 0 ]; do
     --reformat) REFORMAT=1; shift;;
     --allow-internal) ALLOW_INTERNAL=1; shift;;
     --allow-root) ALLOW_ROOT=1; shift;;
+    --no-nvram) DO_NVRAM=0; shift;;
+    --boot-first) BOOT_FIRST=1; shift;;
+    --no-grub) DO_GRUB=0; shift;;
+    --grub-root) GRUB_ROOT="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     -a|--auto|--host) AUTO_TAILOR=1; shift;;
     -h|--help) usage 0;;
@@ -62,137 +80,262 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-for _v in SYS_SIZE META_SIZE DATA_SIZE; do
-  eval "_x=\$$_v"
-  case "$_x" in *[!0-9]*) ;; *) eval "$_v=${_x}G";; esac   # a bare number is GiB: sgdisk reads "+64" as 64 sectors
-done
+# Sizes -> MiB. A bare number is GiB (sgdisk would read "+64" as 64 sectors).
+to_mib() {
+  _n=${1%[KkMmGgTt]}
+  case "$_n" in ''|*[!0-9]*) return 1;; esac
+  case "$1" in
+    *[Kk]) echo $(( (_n + 1023) / 1024 ));;
+    *[Mm]) echo "$_n";;
+    *[Tt]) echo $(( _n * 1024 * 1024 ));;
+    *) echo $(( _n * 1024 ));;
+  esac
+}
+SYS_MIB=$(to_mib "$SYS_SIZE") || die "bad --sys-size: $SYS_SIZE"
+META_MIB=$(to_mib "$META_SIZE") || die "bad --meta-size: $META_SIZE"
+case "$DATA_SIZE" in
+  rest|max|0|0G) DATA_MIB=0;;
+  *) DATA_MIB=$(to_mib "$DATA_SIZE") || die "bad --data-size: $DATA_SIZE";;
+esac
+[ "$SYS_MIB" -ge 1024 ] || die "--sys-size must be at least 1G (the system image alone is several GB)"
+[ "$META_MIB" -ge 16 ] || die "--meta-size must be at least 16M"
+[ "$DATA_MIB" = 0 ] || [ "$DATA_MIB" -ge "$MIN_DATA_MIB" ] || die "--data-size must be at least $((MIN_DATA_MIB / 1024))G"
+GRUB_ROOT=${GRUB_ROOT%/}; GR=$GRUB_ROOT; [ -n "$GRUB_ROOT" ] || GRUB_ROOT=/   # GR: path prefix ("" for /)
+
 [ -n "$TARGET_DISK" ] || usage 1
 [ -b "$TARGET_DISK" ] || die "$TARGET_DISK is not a valid block device."
+[ "$(id -u)" -eq 0 ] || die "This script requires root privileges. Please run with sudo."
+for c in sfdisk sgdisk lsblk blkid wipefs mkfs.vfat mkfs.ext4 findmnt; do
+  command -v $c >/dev/null 2>&1 || die "missing '$c'"
+done
 
-# Root privileges check
-if [ "$(id -u)" -ne 0 ]; then
-  die "This script requires root privileges. Please run with sudo."
-fi
-
-# Safety guard 1: Check if target disk holds the running root filesystem
-ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null || true)
-if [ -n "$ROOT_DEV" ] && echo "$ROOT_DEV" | grep -q "${TARGET_DISK##*/}"; then
-  if [ $ALLOW_ROOT -eq 0 ]; then
-    die "$TARGET_DISK holds your active host root filesystem ($ROOT_DEV). To prevent accidents, pass --allow-root if you intentionally wish to partition free space on this drive."
-  fi
-fi
-
-# Safety guard 2: an internal disk (NVMe or fixed SATA, often Windows) needs --allow-internal. Removable and USB disks do not.
+# Safety guard 1: the disk that holds the running root filesystem
 _d=${TARGET_DISK##*/}
+ROOT_DEV=$(findmnt -n -o SOURCE / 2>/dev/null || true)
+ROOT_DISK=$(lsblk -no PKNAME "$ROOT_DEV" 2>/dev/null | head -1 || true)
+if [ "$ROOT_DISK" = "$_d" ] || { [ -z "$ROOT_DISK" ] && echo "$ROOT_DEV" | grep -q "$_d"; }; then
+  [ $ALLOW_ROOT -eq 1 ] || die "$TARGET_DISK holds your running root filesystem ($ROOT_DEV). Pass --allow-root if you intend to use free space on this drive."
+fi
+# Safety guard 2: an internal disk (NVMe or fixed SATA, often Windows) needs --allow-internal. Removable and USB disks do not.
 if [ "$(cat /sys/block/$_d/removable 2>/dev/null)" != 1 ] && ! readlink -f "/sys/block/$_d" 2>/dev/null | grep -q '/usb[0-9]'; then
-  if [ $ALLOW_INTERNAL -eq 0 ]; then
-    die "$TARGET_DISK is an internal disk. To protect internal Windows/Linux drives, pass --allow-internal to confirm."
-  fi
+  [ $ALLOW_INTERNAL -eq 1 ] || die "$TARGET_DISK is an internal disk. To protect internal Windows/Linux drives, pass --allow-internal to confirm."
 fi
 
 say "Target disk: $TARGET_DISK"
+PT=$(sfdisk -d "$TARGET_DISK" 2>/dev/null) || die "cannot read the partition table of $TARGET_DISK"
+echo "$PT" | grep -q '^label: gpt' || die "dual-boot needs a GPT disk; $TARGET_DISK is not"
+SS=$(cat /sys/block/$_d/queue/logical_block_size 2>/dev/null || echo 512)
+SPM=$((1048576 / SS))   # sectors per MiB
 
-# Auto-detect EFI partition if not specified
+# A partition by GPT name (it exists before it has a filesystem), else by filesystem label.
+part_by_name() { echo "$PT" | awk -v n="name=\"$1\"" 'index($0, n) {print $1; exit}'; }
+part_by_label() { lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk -v l="$1" '$2 == l {print "/dev/" $1; exit}'; }
+find_part() { _p=$(part_by_name "$1"); [ -n "$_p" ] || _p=$(part_by_label "$1"); echo "$_p"; }
+part_field() { echo "$PT" | awk -v p="$1" -v f="$2" '$1 == p { if (match($0, f "= *[0-9]+")) { s = substr($0, RSTART, RLENGTH); sub(/.*= */, "", s); print s } }'; }
+fstype() { blkid -p -s TYPE -o value "$1" 2>/dev/null || true; }
+fslabel() { blkid -p -s LABEL -o value "$1" 2>/dev/null || true; }
+has_fs() { [ "$(fstype "$1")" = "$2" ] && [ "$(fslabel "$1")" = "$3" ]; }   # dev type label
+
+# The EFI system partition: GPT type first, the usual labels as a fallback
 if [ -z "$EFI_PART" ]; then
-  for p in $(lsblk -rn -o NAME,PARTTYPE "$TARGET_DISK" 2>/dev/null | awk '$2 ~ /c12a7328-f81f-11d2-ba4b-00a0c93ec93b/i {print $1}'); do
-    EFI_PART="/dev/$p"
-    break
+  EFI_PART=$(echo "$PT" | awk 'toupper($0) ~ /TYPE=C12A7328-F81F-11D2-BA4B-00A0C93EC93B/ {print $1; exit}')
+  [ -n "$EFI_PART" ] || EFI_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2 ~ /^(EFI|SYSTEM|ESP|GBOS_EFI)$/ {print "/dev/" $1; exit}')
+fi
+[ -n "$EFI_PART" ] && [ -b "$EFI_PART" ] || die "Could not identify the EFI partition on $TARGET_DISK. Specify it with --efi-part."
+[ "$(fstype "$EFI_PART")" = vfat ] || die "$EFI_PART is not a FAT EFI system partition"
+ESP_UUID=$(blkid -s UUID -o value "$EFI_PART" 2>/dev/null || true)
+echo "EFI partition: $EFI_PART (UUID $ESP_UUID)"
+
+# What gets installed must all be here before anything is written.
+KERNEL=$U/out/BOOTX64.EFI
+[ -f "$KERNEL" ] || die "no kernel: $KERNEL is missing"
+SUPER=""
+for s in "$ROOT/dist" "$ROOT/build"; do [ -f "$s/super.img" ] && [ -f "$s/super.layout" ] && { SUPER=$s; break; }; done
+if [ -z "$SUPER" ]; then
+  for n in system_a vendor_a product_a system_ext_a system_dlkm_a vendor_dlkm_a; do
+    [ -f "$ROOT/lapis/parts/$n.img" ] && continue
+    [ $DRY_RUN -eq 1 ] && { warn "no system image yet ($ROOT/lapis/parts/$n.img): ./build.sh downloads it"; break; }
+    die "no system image: $ROOT/lapis/parts/$n.img is missing (run ./build.sh first)"
   done
-  if [ -z "$EFI_PART" ]; then
-    # Fallback to partition 1 or 2 if labeled EFI / SYSTEM
-    for p in $(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2 ~ /^(EFI|SYSTEM|ESP|GBOS_EFI)$/i {print $1}'); do
-      EFI_PART="/dev/$p"
-      break
-    done
-  fi
 fi
 
-[ -n "$EFI_PART" ] && [ -b "$EFI_PART" ] || die "Could not identify EFI partition on $TARGET_DISK. Specify with --efi-part."
-say "EFI partition: $EFI_PART"
-
-# Check for existing GBOS partitions
-SYS_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOSSYS"{print "/dev/"$1; exit}')
-META_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOS_META"{print "/dev/"$1; exit}')
-DATA_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOS_DATA"{print "/dev/"$1; exit}')
-
-case "$TARGET_DISK" in
-  *[0-9]) P_PREFIX="${TARGET_DISK}p";;
-  *) P_PREFIX="${TARGET_DISK}";;
-esac
-
-if [ -n "$SYS_PART" ] && [ -n "$META_PART" ] && [ -n "$DATA_PART" ]; then
-  say "Found existing gbOS86 partitions on $TARGET_DISK:"
-  echo "  GBOSSYS:   $SYS_PART"
-  echo "  GBOS_META: $META_PART"
-  echo "  GBOS_DATA: $DATA_PART"
+# Existing gbOS86 partitions? GBOSSYS and GBOS_DATA are required, GBOS_META is optional (gbos/metadata.img replaces it).
+SYS_PART=$(find_part GBOSSYS); META_PART=$(find_part GBOS_META); DATA_PART=$(find_part GBOS_DATA)
+if [ -n "$SYS_PART" ] && [ -n "$DATA_PART" ]; then
   ALREADY_PARTITIONED=1
+  say "Found existing gbOS86 partitions on $TARGET_DISK: GBOSSYS $SYS_PART, GBOS_META ${META_PART:-none}, GBOS_DATA $DATA_PART"
+elif [ -n "$SYS_PART$META_PART$DATA_PART" ]; then
+  die "only some gbOS86 partitions exist on $TARGET_DISK (GBOSSYS '${SYS_PART}', GBOS_META '${META_PART}', GBOS_DATA '${DATA_PART}'). Delete them or create the missing ones by hand; nothing was changed."
 else
   ALREADY_PARTITIONED=0
 fi
 
+# Which partitions get a new filesystem: all new ones; existing ones with --reformat, or when they lack their filesystem
+# (type and label: an earlier run stopped between partitioning and formatting).
+FORMAT_SYS=0; FORMAT_META=0; FORMAT_DATA=0
+if [ $ALREADY_PARTITIONED -eq 0 ] || [ $REFORMAT -eq 1 ]; then
+  FORMAT_SYS=1; FORMAT_DATA=1; [ $ALREADY_PARTITIONED -eq 0 ] || [ -n "$META_PART" ] && FORMAT_META=1
+else
+  has_fs "$SYS_PART" vfat GBOSSYS || FORMAT_SYS=1
+  has_fs "$DATA_PART" ext4 GBOS_DATA || FORMAT_DATA=1
+  [ -z "$META_PART" ] || has_fs "$META_PART" ext4 GBOS_META || FORMAT_META=1
+fi
+for x in "$SYS_PART $FORMAT_SYS" "$META_PART $FORMAT_META" "$DATA_PART $FORMAT_DATA"; do
+  set -- $x
+  [ "$2" = 1 ] && [ -n "$(findmnt -n -o TARGET --source "$1" 2>/dev/null)" ] && die "$1 is mounted and would be formatted; unmount it first"
+done
+
+# New partitions: placed one after another at the start of the largest free block, at explicit sectors.
+if [ $ALREADY_PARTITIONED -eq 0 ]; then
+  FREE_FIRST=$(sgdisk -F "$TARGET_DISK" 2>/dev/null | tail -1)
+  FREE_LAST=$(sgdisk -E "$TARGET_DISK" 2>/dev/null | tail -1)
+  case "$FREE_FIRST$FREE_LAST" in ''|*[!0-9]*) die "sgdisk could not find free space on $TARGET_DISK";; esac
+  FREE_MIB=$(( (FREE_LAST - FREE_FIRST + 1) / SPM ))
+  S1=$FREE_FIRST;                                   E1=$(( S1 + SYS_MIB * SPM - 1 ))
+  S2=$(( (E1 + SPM) / SPM * SPM ));                 E2=$(( S2 + META_MIB * SPM - 1 ))
+  S3=$(( (E2 + SPM) / SPM * SPM ))
+  if [ "$DATA_MIB" = 0 ]; then E3=$FREE_LAST; else E3=$(( S3 + DATA_MIB * SPM - 1 )); fi
+  [ "$E3" -le "$FREE_LAST" ] && [ $(( (E3 - S3 + 1) / SPM )) -ge $MIN_DATA_MIB ] || die "the largest free block on $TARGET_DISK is $FREE_MIB MiB (sectors $FREE_FIRST-$FREE_LAST): too small for GBOSSYS $SYS_MIB MiB + GBOS_META $META_MIB MiB + GBOS_DATA $([ "$DATA_MIB" = 0 ] && echo "at least $MIN_DATA_MIB" || echo $DATA_MIB) MiB. Nothing was changed."
+  DATA_MIB_REAL=$(( (E3 - S3 + 1) / SPM ))
+  say "Plan: in the free block of $FREE_MIB MiB (sectors $FREE_FIRST-$FREE_LAST):"
+  echo "  GBOSSYS   FAT32  $SYS_MIB MiB  (sectors $S1-$E1)"
+  echo "  GBOS_META ext4   $META_MIB MiB  (sectors $S2-$E2)"
+  echo "  GBOS_DATA ext4   $DATA_MIB_REAL MiB  (sectors $S3-$E3)"
+else
+  say "Plan: update the files on the existing partitions."
+  [ $FORMAT_SYS = 1 ] && echo "  GBOSSYS $SYS_PART will be formatted"
+  [ $FORMAT_META = 1 ] && echo "  GBOS_META $META_PART will be formatted"
+  [ $FORMAT_DATA = 1 ] && echo "  GBOS_DATA $DATA_PART will be formatted (gbOS86's apps and data are erased)"
+fi
+
+# The kernel has to fit on the EFI partition (it replaces an older EFI/gbos86/BOOTX64.EFI). Mount it read-only to look if needed.
+TMP_MNTS=""
+cleanup() { for m in $TMP_MNTS; do umount "$m" 2>/dev/null; rmdir "$m" 2>/dev/null; done; }
+trap cleanup EXIT INT TERM
+mount_part() { # dev [ro]: sets MP to its mount point. An existing mount is reused (for writing only if it is read-write).
+  MP=$(findmnt -n -o TARGET --source "$1" 2>/dev/null | head -1)
+  if [ -n "$MP" ]; then
+    [ "$2" = ro ] || findmnt -n -o OPTIONS --source "$1" | head -1 | grep -q '^rw' || { warn "$1 is mounted read-only on $MP; unmount it first"; return 1; }
+    return 0
+  fi
+  MP=$(mktemp -d); mount ${2:+-o $2} "$1" "$MP" || { rmdir "$MP"; return 1; }; TMP_MNTS="$MP $TMP_MNTS"
+}
+umount_part() { case " $TMP_MNTS " in *" $1 "*) umount "$1" && rmdir "$1"; TMP_MNTS=$(echo " $TMP_MNTS " | sed "s# $1 # #");; esac; }
+mount_part "$EFI_PART" ro || die "cannot mount $EFI_PART"; EFI_MNT=$MP
+K_KB=$(( $(stat -c %s "$KERNEL") / 1024 ))
+OLD_KB=0; [ -f "$EFI_MNT/EFI/gbos86/BOOTX64.EFI" ] && OLD_KB=$(( $(stat -c %s "$EFI_MNT/EFI/gbos86/BOOTX64.EFI") / 1024 ))
+EFI_FREE_KB=$(df -kP "$EFI_MNT" | awk 'NR==2 {print $4}')
+[ $(( EFI_FREE_KB + OLD_KB )) -ge $(( K_KB + 1024 )) ] || die "$EFI_PART has $((EFI_FREE_KB / 1024)) MB free; the kernel needs $((K_KB / 1024 + 1)) MB. Nothing was changed."
+echo "  kernel -> $EFI_PART EFI/gbos86/BOOTX64.EFI ($((K_KB / 1024)) MB; $((EFI_FREE_KB / 1024)) MB free$([ $OLD_KB -gt 0 ] && echo ", replaces the existing one"))"
+umount_part "$EFI_MNT"
+
+# GRUB: an entry that boots EFI/gbos86/BOOTX64.EFI from this ESP (as usb/install.sh writes it) or chainloads this GBOSSYS is
+# current; any other "Googlebook OS" entry is stale (an older install) and is reported, not edited.
+GRUB_DIR=""; GRUB_FILE=""; GRUB_STALE=""; GRUB_OK=""
+if [ $DO_GRUB = 1 ]; then
+  for g in "$GR/boot/grub" "$GR/boot/grub2"; do [ -f "$g/grub.cfg" ] && { GRUB_DIR=$g; break; }; done
+  SYS_UUID=""; [ -n "$SYS_PART" ] && [ $FORMAT_SYS = 0 ] && SYS_UUID=$(blkid -s UUID -o value "$SYS_PART" 2>/dev/null || true)
+  for f in "$GRUB_DIR/custom.cfg" "$GR/etc/grub.d/40_custom"; do
+    [ -f "$f" ] && grep -q "Googlebook OS" "$f" 2>/dev/null || continue
+    if { [ -n "$ESP_UUID" ] && grep -q -- "--fs-uuid --set=root $ESP_UUID" "$f" && grep -q "/EFI/gbos86/BOOTX64.EFI" "$f"; } || \
+       { [ -n "$SYS_UUID" ] && grep -q -- "--fs-uuid --set=root $SYS_UUID" "$f" && grep -q "chainloader /EFI/BOOT/BOOTX64.EFI" "$f"; }; then
+      GRUB_OK="$GRUB_OK $f"
+    else
+      GRUB_STALE="$GRUB_STALE $f"
+    fi
+  done
+  if [ -n "$GRUB_OK" ]; then echo "  GRUB: an entry for this install is already in$GRUB_OK: not changed"
+  elif [ -n "$GRUB_DIR" ] && grep -q 'custom\.cfg' "$GRUB_DIR/grub.cfg" 2>/dev/null; then GRUB_FILE=$GRUB_DIR/custom.cfg; echo "  GRUB: add '$GRUB_LABEL' to $GRUB_FILE"
+  elif [ -f "$GR/etc/grub.d/40_custom" ]; then GRUB_FILE=$GR/etc/grub.d/40_custom; echo "  GRUB: add '$GRUB_LABEL' to $GRUB_FILE$([ "$GRUB_ROOT" = / ] && echo " and run update-grub")"
+  else echo "  GRUB: none found under $GRUB_ROOT; boot gbOS86 from the UEFI boot menu"; fi
+  for f in $GRUB_STALE; do
+    warn "$f has a 'Googlebook OS' entry that does not boot this install (an older install?). It is left as it is; remove it by hand:"
+    grep -n -A7 "Googlebook OS" "$f" | sed 's/^/    /' >&2
+  done
+fi
+
+# UEFI boot entry
+EFI_NUM=$(cat "/sys/class/block/${EFI_PART##*/}/partition" 2>/dev/null || echo "$EFI_PART" | grep -o '[0-9]*$')
+EFI_DISK=/dev/$(lsblk -no PKNAME "$EFI_PART" 2>/dev/null | head -1)
+[ "$EFI_DISK" != /dev/ ] || EFI_DISK=$(echo "$EFI_PART" | sed -E 's/p?[0-9]+$//')
+NVRAM=0
+if [ $DO_NVRAM = 1 ]; then
+  if ! command -v efibootmgr >/dev/null 2>&1 || [ ! -d /sys/firmware/efi/efivars ]; then echo "  UEFI: no efibootmgr/efivars: no boot entry added"
+  elif efibootmgr 2>/dev/null | grep -q "Googlebook OS"; then echo "  UEFI: a 'Googlebook OS' boot entry exists: not changed"
+  else NVRAM=1; echo "  UEFI: add boot entry '$GRUB_LABEL' ($EFI_DISK partition $EFI_NUM, \\EFI\\gbos86\\BOOTX64.EFI), $([ $BOOT_FIRST = 1 ] && echo "first in BootOrder" || echo "at the end of BootOrder (the current order is kept)")"; fi
+fi
+
 if [ $DRY_RUN -eq 1 ]; then
-  say "[DRY RUN] Target: $TARGET_DISK (partitions present: $(lsblk -no NAME "$TARGET_DISK" 2>/dev/null | tr '\n' ' '))"
-  say "[DRY RUN] Would allocate $SYS_SIZE for GBOSSYS, $META_SIZE for GBOS_META, and $DATA_SIZE for GBOS_DATA into free space."
+  say "[DRY RUN] nothing was written."
   exit 0
 fi
 
-# Nothing has been written yet. Show the disk and make the user type its serial (the same rule as the live USB installer).
-if [ $ALREADY_PARTITIONED -eq 0 ]; then
-  command -v sgdisk >/dev/null 2>&1 || die "sgdisk is required to partition $TARGET_DISK non-destructively."
+# Partitioning or formatting: show the disk and make the user type its serial (the same rule as the live USB installer).
+if [ $ALREADY_PARTITIONED -eq 0 ] || [ $FORMAT_SYS$FORMAT_META$FORMAT_DATA != 000 ]; then
   say "Disk $TARGET_DISK:"
-  lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTTYPENAME "$TARGET_DISK" 2>/dev/null
+  lsblk -o NAME,SIZE,FSTYPE,LABEL,PARTLABEL,PARTTYPENAME "$TARGET_DISK" 2>/dev/null
   DSERIAL=$(lsblk -dno SERIAL "$TARGET_DISK" 2>/dev/null | tr -d ' ')
   [ -n "$DSERIAL" ] || DSERIAL=$(basename "$TARGET_DISK")
-  echo "This adds GBOSSYS ($SYS_SIZE), GBOS_META ($META_SIZE) and GBOS_DATA ($DATA_SIZE) in the unallocated space, puts the kernel in $EFI_PART"
-  echo "as EFI/gbos86/BOOTX64.EFI and, when GRUB is installed on this machine, adds a menu entry to /etc/grub.d/40_custom. No existing partition is changed."
+  if [ $ALREADY_PARTITIONED -eq 0 ]; then
+    echo "This adds GBOSSYS, GBOS_META and GBOS_DATA in the unallocated space as planned above. No existing partition is changed."
+  else
+    echo "This formats the gbOS86 partitions named in the plan above. No other partition is changed."
+  fi
   printf 'To continue type the serial number (%s) exactly: ' "$DSERIAL"
   read -r _a
   [ "$_a" = "$DSERIAL" ] || die "Cancelled. Nothing was written to $TARGET_DISK."
 fi
 
-# Partition if not already present
 if [ $ALREADY_PARTITIONED -eq 0 ]; then
-  command -v sgdisk >/dev/null 2>&1 || die "sgdisk is required to partition $TARGET_DISK non-destructively."
-  say "Creating gbOS86 partitions non-destructively into unallocated free space..."
-  # '0' tells sgdisk to pick the next unused partition number automatically
+  say "Creating the gbOS86 partitions ..."
   sgdisk \
-    -n 0:0:+"$SYS_SIZE"  -t 0:0700 -c 0:"GBOSSYS" \
-    -n 0:0:+"$META_SIZE" -t 0:8300 -c 0:"GBOS_META" \
-    -n 0:0:+"$DATA_SIZE" -t 0:8300 -c 0:"GBOS_DATA" \
-    "$TARGET_DISK" || die "sgdisk failed to create partitions. Check if sufficient unallocated free space exists on $TARGET_DISK."
-  partprobe "$TARGET_DISK" 2>/dev/null || sleep 2
-
-  SYS_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOSSYS"{print "/dev/"$1; exit}')
-  META_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOS_META"{print "/dev/"$1; exit}')
-  DATA_PART=$(lsblk -rn -o NAME,LABEL "$TARGET_DISK" 2>/dev/null | awk '$2=="GBOS_DATA"{print "/dev/"$1; exit}')
-
-  [ -n "$SYS_PART" ] && [ -n "$META_PART" ] && [ -n "$DATA_PART" ] || die "Could not resolve newly created partition device names on $TARGET_DISK"
+    -n 0:$S1:$E1 -t 0:0700 -c 0:GBOSSYS \
+    -n 0:$S2:$E2 -t 0:8300 -c 0:GBOS_META \
+    -n 0:$S3:$E3 -t 0:8300 -c 0:GBOS_DATA \
+    "$TARGET_DISK" || die "sgdisk failed to create the partitions (sgdisk does not save a table when an operation fails)."
+  # The other partitions of a disk in use stay busy: tell the kernel about the new ones only.
+  partprobe "$TARGET_DISK" 2>/dev/null || partx -a "$TARGET_DISK" 2>/dev/null || true
+  i=0
+  while :; do
+    command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || sleep 1
+    PT=$(sfdisk -d "$TARGET_DISK" 2>/dev/null)
+    SYS_PART=$(part_by_name GBOSSYS); META_PART=$(part_by_name GBOS_META); DATA_PART=$(part_by_name GBOS_DATA)
+    [ -b "$SYS_PART" ] && [ -b "$META_PART" ] && [ -b "$DATA_PART" ] && break
+    i=$((i + 1)); [ $i -lt 10 ] || die "the new partitions (GBOSSYS '$SYS_PART', GBOS_META '$META_PART', GBOS_DATA '$DATA_PART') did not appear as block devices. They are empty: reboot and run this again with --reformat (it keeps them and formats them)."
+    partx -a "$TARGET_DISK" 2>/dev/null || partx -u "$TARGET_DISK" 2>/dev/null || true
+    sleep 1
+  done
+  # They must be exactly what was planned (so a format can never hit another partition).
+  for x in "$SYS_PART $S1 $E1" "$META_PART $S2 $E2" "$DATA_PART $S3 $E3"; do
+    set -- $x
+    _s=$(part_field "$1" start); _n=$(part_field "$1" size)
+    [ "$_s" = "$2" ] && [ $(( _s + _n - 1 )) = "$3" ] || die "$1 is not where it was planned (start $_s size $_n, planned $2-$3); not formatting anything"
+  done
+  echo "  GBOSSYS $SYS_PART, GBOS_META $META_PART, GBOS_DATA $DATA_PART"
 fi
 
-# Format partitions
-if [ $ALREADY_PARTITIONED -eq 0 ] || [ $REFORMAT -eq 1 ]; then
-  say "Formatting partitions ($SYS_PART, $META_PART, $DATA_PART)..."
-  mkfs.vfat -F 32 -n GBOSSYS "$SYS_PART"
-  mkfs.ext4 -F -L GBOS_META "$META_PART"
-  mkfs.ext4 -F -O verity -L GBOS_DATA "$DATA_PART"
-fi
+# Format. wipefs first: the space can hold signatures of an older, deleted install.
+if [ $FORMAT_SYS = 1 ]; then say "Formatting GBOSSYS ($SYS_PART) ..."; wipefs -a -q "$SYS_PART"; mkfs.vfat -F 32 -n GBOSSYS "$SYS_PART"; fi
+if [ $FORMAT_META = 1 ]; then say "Formatting GBOS_META ($META_PART) ..."; wipefs -a -q "$META_PART"; mkfs.ext4 -F -q -L GBOS_META "$META_PART"; fi
+if [ $FORMAT_DATA = 1 ]; then say "Formatting GBOS_DATA ($DATA_PART) ..."; wipefs -a -q "$DATA_PART"; mkfs.ext4 -F -q -m 0 -O verity -L GBOS_DATA "$DATA_PART"; fi
+command -v udevadm >/dev/null 2>&1 && udevadm settle --timeout=10 2>/dev/null || true
 
 # Populate GBOSSYS
-MNT_SYS=$(mktemp -d)
-trap 'umount "$MNT_SYS" 2>/dev/null; rmdir "$MNT_SYS" 2>/dev/null' EXIT INT TERM
-mount "$SYS_PART" "$MNT_SYS"
+mount_part "$SYS_PART" || die "cannot mount $SYS_PART"; MNT_SYS=$MP
+LOG=$MNT_SYS/gbos/logs/dualboot-install.txt
+mkdir -p "$MNT_SYS/EFI/BOOT" "$MNT_SYS/gbos/logs"
+{ echo "== $(date -u '+%Y-%m-%d %H:%M:%S UTC') install_dualboot.sh $(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
+  echo "target $TARGET_DISK  efi $EFI_PART  sys $SYS_PART  meta ${META_PART:-none}  data $DATA_PART  formatted sys=$FORMAT_SYS meta=$FORMAT_META data=$FORMAT_DATA"; } >> "$LOG"
 
 # Create loopback metadata.img if physical GBOS_META partition is absent
 if [ -z "$META_PART" ] && [ ! -f "$MNT_SYS/gbos/metadata.img" ]; then
   say "Creating loopback metadata.img (64 MB ext4) inside GBOSSYS..."
-  mkdir -p "$MNT_SYS/gbos"
   dd if=/dev/zero of="$MNT_SYS/gbos/metadata.img" bs=1M count=64 status=none
   mkfs.ext4 -F -q -L GBOS_META "$MNT_SYS/gbos/metadata.img"
 fi
 
 say "Copying system files to $SYS_PART (GBOSSYS)..."
-mkdir -p "$MNT_SYS/EFI/BOOT" "$MNT_SYS/gbos/logs"
-[ -f "$U/out/BOOTX64.EFI" ] && cp "$U/out/BOOTX64.EFI" "$MNT_SYS/EFI/BOOT/BOOTX64.EFI"
+cp "$KERNEL" "$MNT_SYS/EFI/BOOT/BOOTX64.EFI"
 [ -f "$ROOT/kernel/out/busybox" ] && cp "$ROOT/kernel/out/busybox" "$MNT_SYS/busybox"
 
 for f in hook.sh optimize.sh aidiag.sh native_zygote.sh early_patch.sh hwdetect.sh install.sh apex_patch.sh gbos.cfg \
@@ -218,11 +361,8 @@ for _m in "$MNT_SYS/gbos/modules/lib/modules/"*-gbos-whl; do
 done
 
 # The system image: build it from lapis/parts (the same call as tools/make_gbos86_image.sh), unless a built one is around
-SUPER=""
-for s in "$ROOT/dist" "$ROOT/build"; do [ -f "$s/super.img" ] && [ -f "$s/super.layout" ] && { SUPER=$s; break; }; done
 if [ -z "$SUPER" ]; then
   P=$ROOT/lapis/parts
-  for n in system_a vendor_a product_a system_ext_a system_dlkm_a vendor_dlkm_a; do [ -f "$P/$n.img" ] || die "no system image: $P/$n.img is missing (run ./build.sh first)"; done
   mkdir -p "$ROOT/build"
   say "Building super.img from lapis/parts ..."
   python3 "$U/make_super.py" "$ROOT/build/super.img" "$ROOT/build/super.layout" \
@@ -246,44 +386,60 @@ if [ "$AUTO_TAILOR" = 1 ]; then
   fi
 fi
 
-# Copy kernel to EFI partition
-MNT_EFI=$(mktemp -d)
-mount "$EFI_PART" "$MNT_EFI"
-mkdir -p "$MNT_EFI/EFI/gbos86"
-if [ -f "$U/out/BOOTX64.EFI" ]; then
-  cp "$U/out/BOOTX64.EFI" "$MNT_EFI/EFI/gbos86/BOOTX64.EFI"
-  say "Installed gbOS86 UEFI kernel to $EFI_PART -> EFI/gbos86/BOOTX64.EFI"
-fi
-umount "$MNT_EFI" && rmdir "$MNT_EFI"
+# The kernel on the EFI partition: only EFI/gbos86/ is written.
+mount_part "$EFI_PART" || die "cannot mount $EFI_PART read-write"; EFI_MNT=$MP
+mkdir -p "$EFI_MNT/EFI/gbos86"
+cp "$KERNEL" "$EFI_MNT/EFI/gbos86/BOOTX64.EFI"
+[ -f "$U/Add-gbOS-to-Windows-BootMenu.bat" ] && cp "$U/Add-gbOS-to-Windows-BootMenu.bat" "$EFI_MNT/EFI/gbos86/" 2>/dev/null || true
+sync
+cmp -s "$KERNEL" "$EFI_MNT/EFI/gbos86/BOOTX64.EFI" || die "the kernel on $EFI_PART does not match $KERNEL"
+say "Installed the kernel to $EFI_PART -> EFI/gbos86/BOOTX64.EFI"
+umount_part "$EFI_MNT"
 
-# Register in motherboard UEFI NVRAM if efibootmgr is available
-if command -v efibootmgr >/dev/null 2>&1 && [ -d /sys/firmware/efi/efivars ]; then
-  EFI_NUM=$(echo "$EFI_PART" | grep -o '[0-9]*$')
-  EFI_DISK=$(echo "$EFI_PART" | sed -E 's/p?[0-9]+$//')
-  if ! efibootmgr 2>/dev/null | grep -q "Googlebook OS"; then
-    say "Registering 'Googlebook OS' in motherboard UEFI NVRAM..."
-    efibootmgr -c -d "$EFI_DISK" -p "$EFI_NUM" -L "Googlebook OS" -l '\EFI\gbos86\BOOTX64.EFI' >/dev/null 2>&1 || true
+# UEFI boot entry. efibootmgr -c puts a new entry first in BootOrder; unless --boot-first, the old order is restored with
+# the new entry appended.
+if [ $NVRAM = 1 ]; then
+  OLD_ORDER=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: *//p')
+  echo "BootOrder before: $OLD_ORDER" >> "$LOG"
+  say "Adding UEFI boot entry '$GRUB_LABEL' ..."
+  if efibootmgr -c -d "$EFI_DISK" -p "$EFI_NUM" -L "$GRUB_LABEL" -l '\EFI\gbos86\BOOTX64.EFI' >/dev/null; then
+    NEW=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\{0,1\} Googlebook OS.*/\1/p' | head -1)
+    if [ $BOOT_FIRST = 0 ] && [ -n "$NEW" ] && [ -n "$OLD_ORDER" ]; then
+      efibootmgr -o "$OLD_ORDER,$NEW" >/dev/null || warn "could not restore BootOrder; it is now: $(efibootmgr | sed -n 's/^BootOrder: *//p'). Restore it with: efibootmgr -o $OLD_ORDER,$NEW"
+    fi
+  else
+    warn "efibootmgr could not add the boot entry; boot gbOS86 from GRUB"
   fi
+  echo "BootOrder after:  $(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: *//p')" | tee -a "$LOG"
 fi
 
-# Configure GRUB 40_custom if running on Linux with GRUB
-if [ -d /etc/grub.d ] && command -v update-grub >/dev/null 2>&1; then
-  SYS_UUID=$(blkid -s UUID -o value "$SYS_PART" 2>/dev/null || true)
-  if [ -n "$SYS_UUID" ] && ! grep -q "Googlebook OS" /etc/grub.d/40_custom 2>/dev/null; then
-    say "Adding gbOS86 dual-boot menu entry to /etc/grub.d/40_custom..."
-    cat <<GRUB_EOF >> /etc/grub.d/40_custom
+# GRUB entry
+if [ -n "$GRUB_FILE" ]; then
+  [ -n "$ESP_UUID" ] || die "no UUID on $EFI_PART; cannot write a GRUB entry"
+  cp "$GRUB_FILE" "$GRUB_FILE.gbos-bak" 2>/dev/null || true
+  cat >> "$GRUB_FILE" <<GRUB_EOF
 
-menuentry "Googlebook OS (gbOS86 persistent)" --class android --class gnu-linux --class os {
+# Googlebook OS (gbOS86) Persistent
+menuentry "$GRUB_LABEL" --class android --class os {
     insmod part_gpt
     insmod fat
-    search --no-floppy --fs-uuid --set=root $SYS_UUID
-    chainloader /EFI/BOOT/BOOTX64.EFI
+    search --no-floppy --fs-uuid --set=root $ESP_UUID
+    linux /EFI/gbos86/BOOTX64.EFI $GRUB_ARGS
 }
 GRUB_EOF
-    update-grub || true
-  fi
+  say "Added '$GRUB_LABEL' to $GRUB_FILE (the previous file is $GRUB_FILE.gbos-bak)"
+  echo "GRUB entry added to $GRUB_FILE" >> "$LOG"
+  case "$GRUB_FILE" in
+    */etc/grub.d/40_custom)
+      if [ "$GRUB_ROOT" = / ]; then
+        if command -v update-grub >/dev/null 2>&1; then update-grub || warn "update-grub failed"
+        elif command -v grub2-mkconfig >/dev/null 2>&1; then grub2-mkconfig -o "$GRUB_DIR/grub.cfg" || warn "grub2-mkconfig failed"
+        else warn "run update-grub (or grub-mkconfig) yourself"; fi
+      fi;;
+  esac
 fi
 
 sync
-say "gbOS86 persistent dual-boot installation complete!"
-echo "Reboot and select gbOS86 from GRUB or your UEFI boot menu (F12)."
+umount_part "$MNT_SYS"
+say "gbOS86 dual-boot installation complete!"
+echo "Reboot and select '$GRUB_LABEL' in GRUB, or in the UEFI boot menu."
