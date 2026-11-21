@@ -1,0 +1,6 @@
+Ubuntu shim-signed 1.59+15.8-0ubuntu2 (installed package), written by tools/fetch_shim.sh.
+Source: https://launchpad.net/ubuntu/+source/shim-signed (shim: https://github.com/rhboot/shim, BSD-2-Clause, see COPYRIGHT)
+
+shimx64.efi  = /usr/lib/shim/shimx64.efi.signed.latest  sha256 4c89145e958cf592a6f16552eadf112ef2c1c525e2435c2761e6a99fa88188b3  signed by: Microsoft Windows UEFI Driver Publisher
+mmx64.efi    = /usr/lib/shim/mmx64.efi                  sha256 5f9fc41db3dfe3b581fc20cae696af82c5ca21e96071ec9c4c28ee4a15f989d8  signed by: Canonical Ltd. Secure Boot Signing (2022 v1)
+COPYRIGHT    = /usr/share/doc/shim-signed/copyright

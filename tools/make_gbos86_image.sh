@@ -3,17 +3,18 @@
 #
 # Supported modes:
 #   standard: ~6.3 GiB GPT image (live USB installer, MODE=ask)
-#     p1 EFI       256 MiB FAT32  EFI/BOOT/BOOTX64.EFI
+#     p1 EFI       256 MiB FAT32  EFI/BOOT/: BOOTX64.EFI (shim) + grubx64.efi (signed kernel), tools/secureboot.py
 #     p2 GBOS        6 GiB FAT32  /gbos: super.img, installer, patches
 #
 #   looper: persistent GPT image matching install.sh layout (MODE=boot)
-#     p1 GBOS_EFI  512 MiB FAT32  EFI/BOOT/BOOTX64.EFI
+#     p1 GBOS_EFI  512 MiB FAT32  EFI/BOOT/ as above
 #     p2 GBOSSYS     8 GiB FAT32  /gbos: super.img, patches, MODE=boot
 #     p3 GBOS_META  64 MiB ext4   Android /metadata
 #     p4 GBOS_DATA   N GiB ext4   Android /data (sparse, expands up to N GiB)
 #
 # Usage:
 #   sh tools/make_gbos86_image.sh [--type standard|looper] [--data-size N_GB] [--auto] [OUT_DIR]
+#   SECURE_BOOT=0 sh tools/make_gbos86_image.sh ...   kernel alone as EFI/BOOT/BOOTX64.EFI (no shim, no signing key)
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 OUT="$ROOT/dist"
@@ -75,7 +76,14 @@ fi
 
 # 2. Everything else stage0/hook/install expect on the stick
 echo "== assembling files ($BUILD_TYPE mode)"
-cp "$U/out/BOOTX64.EFI" "$STAGE/efi/EFI/BOOT/BOOTX64.EFI"
+# Secure Boot (README "Secure Boot"): shim as BOOTX64.EFI, the kernel signed with this machine's key as grubx64.efi, MokManager and
+# the key to enroll. A kernel without a .sbat section (built before kernel #47) or SECURE_BOOT=0: the kernel alone, as before.
+if [ "${SECURE_BOOT:-1}" != 0 ] && python3 "$ROOT/tools/secureboot.py" esp "$STAGE/efi/EFI/BOOT" "$U/out/BOOTX64.EFI"; then :
+else
+  [ "${SECURE_BOOT:-1}" = 0 ] || echo "WARNING: no Secure Boot files (see above): this image boots with Secure Boot off only"
+  rm -f "$STAGE/efi/EFI/BOOT/"*
+  cp "$U/out/BOOTX64.EFI" "$STAGE/efi/EFI/BOOT/BOOTX64.EFI"
+fi
 G="$STAGE/gbos/gbos"
 for f in hook.sh optimize.sh aidiag.sh native_zygote.sh shutdown.sh early_patch.sh hwdetect.sh install.sh apex_patch.sh gbos.cfg crossystem bootdisk.img libkm_compat.so system_ext_manifest.xml soft_gk Add-gbOS-to-Windows-BootMenu.bat; do
   [ -f "$U/$f" ] && cp "$U/$f" "$G/$f"

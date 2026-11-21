@@ -12,16 +12,16 @@
 # What it does:
 #   1. applies the patches (isa_emu, ashmem, i915 colours, SELinux, Surface, ALC269, SoundWire) and
 #      KernelSU (kernel/kernelsu/apply.sh)
-#   2. writes the config (kernel/configure_whl.py --generic), the kernel command line and the
-#      initramfs path, then olddefconfig
+#   2. writes the config (kernel/configure_whl.py --generic), the kernel command line, the SBAT
+#      data (kernel/sbat.csv, needed for Secure Boot) and the initramfs path, then olddefconfig
 #   3. builds bzImage + modules
 #   4. modules_install -> the stage0 initramfs (kernel/stage0_modules.txt) -> rebuild, so the
 #      initramfs is embedded in the kernel
 #   5. copies bzImage to usb/out/BOOTX64.EFI, the modules to usb/modules/ and the Bluetooth modules
 #      to usb/kmod/
 #
-# The kernel image is the bootable kernel (BOOTX64.EFI): copy it to both EFI copies on the stick
-# (EFI/BOOT/ and GBOS/EFI/BOOT/) and pick "1 Update" to install it on the internal disk.
+# The kernel image is the bootable kernel (BOOTX64.EFI, unsigned). tools/secureboot.py esp signs it and writes it with shim to
+# both EFI copies on the stick (EFI/BOOT/ and GBOS/EFI/BOOT/); then pick "1 Update" to install it on the internal disk.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 JOBS=${2:-$(nproc)}
@@ -76,10 +76,14 @@ P=/host/kernel/kernelsu sh /host/kernel/kernelsu/apply.sh | tail -2
 cp /cfg/base.config /build/out/.config
 python3 /host/kernel/configure_whl.py --generic /build/out/.config /build/out/.config.new
 cp /build/out/.config.new /build/out/.config
+# EFI_SBAT_FILE: the kernel's .sbat section (kernel/sbat.csv). Secure Boot needs it: shim refuses to start an image without one
+# (tools/secureboot.py signs the kernel and puts shim in front of it).
 /build/src/scripts/config --file /build/out/.config \\
   --set-str CMDLINE "\$(cat /host/kernel/isa_emu_patch/generic_cmdline.txt)" \\
+  --set-str EFI_SBAT_FILE /host/kernel/sbat.csv \\
   --set-str INITRAMFS_SOURCE ""
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 olddefconfig > /dev/null
+grep -q '^CONFIG_EFI_SBAT=y' /build/out/.config || { echo "CONFIG_EFI_SBAT is not set (EFI_SBAT_FILE needs EFI_STUB)" >&2; exit 1; }
 
 # 3. the kernel and the modules
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 -j$JOBS bzImage modules
@@ -91,7 +95,10 @@ make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 \\
 sh /host/kernel/make_stage0_initramfs.sh /build/modroot_all /build/out/gbos_stage0.cpio
 /build/src/scripts/config --file /build/out/.config --set-str INITRAMFS_SOURCE /build/out/gbos_stage0.cpio
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 olddefconfig > /dev/null
+# Every vmlinux link bumps .version: step 3 already used #prev+1, so put the number back for the shipped (second) link.
+[ -z "\$prev" ] || echo "\$prev" > /build/out/.version
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 -j$JOBS bzImage
+python3 /host/tools/secureboot.py check /build/out/arch/x86/boot/bzImage
 echo "BUILD OK"
 EOF
 
@@ -122,4 +129,4 @@ echo "kernel: usb/out/BOOTX64.EFI ($(wc -c < "$ROOT/usb/out/BOOTX64.EFI" | tr -d
 echo "modules: $(find "$ROOT/usb/modules" -name '*.ko' | wc -l) in usb/modules/"
 echo
 echo "Test it:  kernel/isa_emu_test/run_qemu.py usb/out/BOOTX64.EFI   (expects ISA_EMU_TEST_PASS)"
-echo "Ship it:  copy usb/out/BOOTX64.EFI to both EFI copies on the stick, then '1 Update'."
+echo "Ship it:  python3 tools/secureboot.py esp /Volumes/EFI/EFI/BOOT   (signs it, with shim; same for /Volumes/GBOS/EFI/BOOT), then '1 Update'."

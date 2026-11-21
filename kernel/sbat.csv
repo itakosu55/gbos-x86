@@ -1,0 +1,3 @@
+sbat,1,SBAT Version,sbat,1,https://github.com/rhboot/shim/blob/main/SBAT.md
+linux,1,The Linux Developers,linux,6.18.21,https://linux.org/
+linux.gbos86,1,gbOS86,linux,6.18.21-gbos-whl,https://github.com/linuxkid473/gbos-x86

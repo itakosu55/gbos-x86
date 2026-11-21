@@ -41,7 +41,8 @@ Then flash the generated `.img` file from `dist/`:
 # Flash with balenaEtcher, Rufus, or dd:
 sudo dd if=dist/gbOS86-*.img of=/dev/rdiskN bs=4m status=progress
 ```
-Boot the laptop from the stick (**F12** at the logo, Secure Boot off).
+Boot the laptop from the stick (**F12** at the logo). Secure Boot can stay on with a kernel built from kernel #47 on: the first boot
+asks once to enroll your key ([Secure Boot](#secure-boot)). The kernel in this repository now (#46) predates that: turn Secure Boot off.
 
 `./build.sh --dry-run` shows what it would download (Google's 7.7 GB image, ~1 MB busybox, 14 MB of kernel modules and 70 MB of firmware
 from this repo's [release](https://github.com/linuxkid473/gbos-x86/releases)). It streams only the six partitions it needs out of
@@ -79,7 +80,8 @@ Fedora/RHEL with SELinux enforcing: the scripts add `:z` to the docker bind moun
 
 ```
 UEFI firmware
- └─ EFI/BOOT/BOOTX64.EFI      our kernel (android17-6.18 + patches + KernelSU) with stage0 built in as initramfs
+ └─ EFI/BOOT/BOOTX64.EFI      shim (Ubuntu's, signed by Microsoft's UEFI CA), which starts the next file if your key signed it:
+    EFI/BOOT/grubx64.efi      our kernel (android17-6.18 + patches + KernelSU) with stage0 built in as initramfs
      └─ stage0 (usb/stage0_init.sh, busybox)
          ├─ finds the gbos volume: USB stick (FAT label GBOS) or system volume (GBOSSYS)
          ├─ loads i915, logs to gbos/logs/boot-N/
@@ -89,6 +91,7 @@ UEFI firmware
          ├─ mounts /data, /metadata (ext4 partitions if present, else tmpfs)
          └─ switch_root → /system/bin/init selinux_setup   (Google's Android init, unmodified)
 ```
+(An image built with `SECURE_BOOT=0`, or from a kernel without a `.sbat` section, has the kernel itself as `BOOTX64.EFI`.)
 
 **The core problem:** lapis binaries use CPU instructions this CPU lacks: GFNI, AVX-VNNI, SHA-NI,
 256-bit VAES/VPCLMULQDQ, AVX-IFMA. Two layers deal with that:
@@ -293,7 +296,8 @@ driver inside Google's userspace under QEMU.
 | `tools/make_gbos86_image.sh` | builds the flashable gbOS86 USB image into `dist/` |
 | `usb/audio/` | audio HAL config for the HDA card |
 | `usb/ksu/` | KernelSU's manager app and daemon (installed on the stick by `build.sh`) |
-| `usb/out/BOOTX64.EFI` | **current kernel** (build #30: #29 + gbOS86 boot menu), boots directly from UEFI |
+| `usb/out/BOOTX64.EFI` | **current kernel** (build #30: #29 + gbOS86 boot menu), unsigned; `tools/secureboot.py` signs it and puts shim in front |
+| `usb/shim/`, `tools/secureboot.py` | Secure Boot: Ubuntu's Microsoft-signed shim + MokManager (`tools/fetch_shim.sh`, BSD-2-Clause, `COPYRIGHT`); the signing key and boot-file layout ([Secure Boot](#secure-boot)) |
 | `usb/patched/`, `usb/libkm_compat.so` | patched Google libraries; `usb/patched/MANIFEST` (generated) lists each patch with the sha256 of its original |
 | `tools/swiftshader-android/` | builds SwiftShader as Android's Vulkan HAL (docker + NDK) for AMD GPUs |
 | `usb/kmod/` | `btusb`, `btintel`, `btrtl` built for kernel #29 |
@@ -309,7 +313,7 @@ driver inside Google's userspace under QEMU.
 | `kernel/build_kernel.sh` | builds the whole kernel (patches, config, modules, initramfs) in the `gbos-kbuild` container |
 | `kernel/stage0_modules.txt` | the modules the stage0 initramfs carries (see `kernel/make_stage0_initramfs.sh`) |
 | `kernel/ashmem_shim/` | C memfd ashmem shim |
-| `kernel/isa_emu_test/` | QEMU tests: the emulator (16 instructions), `run_isa_qemu.py` and `run_ksu_qemu.py` (KernelSU in the kernel), hwdetect, `run_installer_emmc.py` (installer on an emulated eMMC), `run_installer_sata.py` (on emulated SATA disks) and `run_shutdown_qemu.py` (GBOSSYS and /metadata come back clean after `usb/shutdown.sh`) |
+| `kernel/isa_emu_test/` | QEMU tests: the emulator (16 instructions), `run_isa_qemu.py` and `run_ksu_qemu.py` (KernelSU in the kernel), hwdetect, `run_installer_emmc.py` (installer on an emulated eMMC), `run_installer_sata.py` (on emulated SATA disks), `run_shutdown_qemu.py` (GBOSSYS and /metadata come back clean after `usb/shutdown.sh`) and `run_secureboot_qemu.py` (shim + signed kernel under OVMF with Secure Boot on) |
 | `isa-emu/` | emulator core + host known-answer tests |
 | `tools/` | image extraction (`lp_extract.py`), ISA scanner (`isa_scan.py`), binary patchers, and the new-build porting tools (`port_build.sh`, `check_new_build.sh`, see [`porting.md`](porting.md)) |
 | `lapis/BUILD` | the Google build this repo is ported to (id, version, download URL) |
@@ -374,6 +378,36 @@ When installing onto a drive with existing operating systems (Windows or Linux),
 
 During installation, live progress bars indicate system image and driver/firmware copying, followed by fast sha256 verification.
 
+### Secure Boot
+Secure Boot can stay on, with a kernel built from kernel #47 on (its `.sbat` section comes from `kernel/sbat.csv`). Tested in QEMU/OVMF
+with Microsoft's keys; **not yet tested on a laptop.** The firmware trusts Microsoft's UEFI CA, which signed **shim** (Ubuntu's build,
+`usb/shim/`); shim is the stick's `EFI/BOOT/BOOTX64.EFI` and starts the kernel (`EFI/BOOT/grubx64.efi`) only if a key in its MOK list
+signed it. That key is yours: `build.sh` creates it on the first build in `~/.config/gbos86/secureboot/` (never in the repository) and
+signs the kernel with it, and the image carries its public half as `EFI/BOOT/gbos86-mok.cer`.
+
+**First boot with Secure Boot on** (once per laptop):
+1. A blue screen says `Verification failed: (0x1A) Security Violation`. Press Enter, then any key within 10 seconds: **MokManager** opens.
+2. **Enroll key from disk** → the stick's EFI partition → `EFI/` → `BOOT/` → `gbos86-mok.cer` → **Continue** (or **View key 0** first:
+   its SHA1 fingerprint is the one the build printed) → **Yes** → **Reboot**.
+3. The stick now boots normally, and so does an install made from it (same key).
+
+- Some recent laptops (Windows 11 "Secured-core", e.g. some Lenovo and Microsoft Surface models) do not trust Microsoft's third-party CA
+  out of the box: allow it in the firmware settings ("Allow Microsoft 3rd Party UEFI CA"; Surface: "Microsoft & 3rd party CA").
+- Keep `mok.key` private (anyone with it can sign a kernel your laptop will start) and keep a copy: a new key (another build machine, a
+  lost key) has to be enrolled again. `python3 tools/secureboot.py key` shows where it is; `GBOS_SB_KEYS=DIR` uses another directory.
+- `SECURE_BOOT=0 ./build.sh` builds the stick as before (the kernel alone as `BOOTX64.EFI`; Secure Boot off). A kernel without `.sbat`
+  (#46 and older) gets that layout automatically, with a warning.
+- The installer copies the same files to the internal disk: `EFI/BOOT/` on a clean install, `EFI/gbos86/` for dual-boot, so the UEFI
+  boot entry and the Windows boot-menu entry (both start `BOOTX64.EFI`) start shim. A dual-boot install made before this keeps its kernel
+  as `EFI/gbos86/BOOTX64.EFI`, because GRUB entries on the other system name that file: it gets the signed kernel but no shim. With Secure
+  Boot on, boot it from a GRUB that runs under shim (Ubuntu, Fedora: enroll the key there with `sudo mokutil --import gbos86-mok.cer`).
+  `./build.sh --dualboot` (`tools/install_dualboot.sh`, run from Linux) still installs the unsigned kernel alone, as before.
+- Secure Boot checks the boot chain only. The kernel has no lockdown LSM, so nothing changes once it runs (modules, KernelSU, debugfs),
+  and SELinux is still permissive (see [Safety](#safety)).
+- Developers: after `kernel/build_kernel.sh`, `python3 tools/secureboot.py esp /Volumes/EFI/EFI/BOOT` signs the kernel and writes shim,
+  the kernel, MokManager and the key to the stick (same for `/Volumes/GBOS/EFI/BOOT`). Tests: `kernel/isa_emu_test/run_secureboot_qemu.py`
+  (`SECUREBOOT_QEMU_PASS`) and `sh tools/test_secureboot.sh` (the installer's file layout).
+
 ### Accessibility (screen reader)
 
 - **Boot menu and installer are spoken** (kernel #46 and newer). The kernel has Speakup built in; `usb/a11y/` on the stick holds `espeakup` +
@@ -437,7 +471,8 @@ Needs macOS or Linux with docker, python3, qemu (for tests) and ~30 GB free. The
    repo publishes the `b` build of that clang, not the `c` one) and the KernelSU sources
    (`/build/inputs/KernelSU`, tag v3.3.1).
 4. **Config:** `kernel/configure_whl.py RECOVERY_KERNEL.config /build/out/.config`, then `make olddefconfig`;
-   set `CONFIG_CMDLINE` from `kernel/isa_emu_patch/debug_cmdline.txt` (`debug_config.sh`) and
+   set `CONFIG_CMDLINE` from `kernel/isa_emu_patch/debug_cmdline.txt` (`debug_config.sh`),
+   `CONFIG_EFI_SBAT_FILE` to `kernel/sbat.csv` (Secure Boot: shim refuses a kernel without `.sbat`) and
    `CONFIG_INITRAMFS_SOURCE=/build/out/gbos_stage0.cpio`.
 5. **Patches:** in the volume, `kernel/isa_emu_patch/apply.sh`, `kernel/ashmem_shim/apply.sh`, and the i915
    scripts `kernel/isa_emu_patch/i915_color_pipeline.sh` (dummy plane COLOR_PIPELINE for the HWC) and
@@ -454,10 +489,12 @@ Needs macOS or Linux with docker, python3, qemu (for tests) and ~30 GB free. The
 6. **Build:** `kernel/isa_emu_patch/build.sh` (in `gbos-kbuild`), then `make modules_install` into
    `usb/modroot`, then `usb/make_initramfs.py usb/modroot usb/stage0.cpio`, copy it to
    `/build/out/gbos_stage0.cpio`, and build again so it's embedded. `arch/x86/boot/bzImage` is
-   `BOOTX64.EFI`. `btusb.ko`/`btintel.ko`/`btrtl.ko` from `/build/out/drivers/bluetooth/` go in `usb/kmod/`.
+   `BOOTX64.EFI` (unsigned; `tools/secureboot.py esp` signs it for Secure Boot). `btusb.ko`/`btintel.ko`/`btrtl.ko` from
+   `/build/out/drivers/bluetooth/` go in `usb/kmod/`.
 7. **Test the emulator:** `kernel/isa_emu_test/run_isa_qemu.py usb/out/BOOTX64.EFI` (expects 16/16 PASS),
    and `kernel/isa_emu_test/run_ksu_qemu.py usb/out/BOOTX64.EFI` (expects KSU_QEMU_TEST_PASS: KernelSU
-   came up, its version is one the manager app accepts, and the x86_64 syscall dispatcher was patched).
+   came up, its version is one the manager app accepts, and the x86_64 syscall dispatcher was patched), and
+   `kernel/isa_emu_test/run_secureboot_qemu.py usb/out/BOOTX64.EFI` (expects SECUREBOOT_QEMU_PASS).
 8. **Userspace pieces:** `tools/fetch_installer_tools.sh`; `gatekeeper/build.sh` (needs `gatekeeper/libs/`
    from the image: `libc`, `libdl` from the runtime APEX, `libbinder_ndk`, `libcrypto`, `liblog`);
    patched libraries with `tools/patch_libz_adler.py` and `tools/sha_redirect.py`. The hashes in
