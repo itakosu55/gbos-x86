@@ -1,8 +1,12 @@
 #!/bin/sh
 # tools/install_dualboot.sh: non-destructive dual-boot install of gbOS86 from a running Linux (no stick needed).
 # Adds GBOSSYS (FAT32), GBOS_META (ext4) and GBOS_DATA (ext4) in the largest unallocated block of the target disk, puts
-# the kernel in the disk's existing EFI system partition as EFI/gbos86/BOOTX64.EFI (nothing else there is touched), and adds a
-# GRUB entry and a UEFI boot entry (appended to BootOrder: the current boot order is kept).
+# the boot files in the disk's existing EFI system partition under EFI/gbos86/ (nothing else there is touched), and adds a
+# GRUB entry and a UEFI boot entry for EFI/gbos86/BOOTX64.EFI (appended to BootOrder: the current boot order is kept).
+# Secure Boot (README "Secure Boot"), the same layout as usb/install.sh: BOOTX64.EFI = shim, grubx64.efi = the kernel signed with
+# the builder's key (tools/secureboot.py), mmx64.efi = MokManager, gbos86-mok.cer = the key. An install that already boots the
+# kernel as EFI/gbos86/BOOTX64.EFI keeps it there (GRUB entries on the other OS name that file): it gets the signed kernel, no
+# shim. A kernel without a .sbat section (#46 and older) or SECURE_BOOT=0: the kernel alone, unsigned (Secure Boot off).
 # Re-running it on a disk that already has the partitions only updates the files: nothing is formatted unless --reformat.
 # Everything is checked before the first write; partitioning or formatting asks for the disk's serial number.
 # Usage: sudo tools/install_dualboot.sh --target /dev/sdX [options]
@@ -52,6 +56,9 @@ Options:
   --grub-root <dir>      The root of the Linux whose GRUB gets the entry (default: /). update-grub only runs for /.
   --dry-run              Show what would be done; write nothing.
   -h, --help             Show this help message.
+
+Environment: SECURE_BOOT=0 installs the kernel alone, unsigned (no shim). GBOS_SB_KEYS=DIR: the signing key's directory
+(tools/secureboot.py; default ~/.config/gbos86/secureboot of the user who ran sudo).
 
 Example:
   sudo $0 --target /dev/nvme0n1 --allow-internal --allow-root --sys-size 8G --data-size rest
@@ -149,6 +156,40 @@ echo "EFI partition: $EFI_PART (UUID $ESP_UUID)"
 # What gets installed must all be here before anything is written.
 KERNEL=$U/out/BOOTX64.EFI
 [ -f "$KERNEL" ] || die "no kernel: $KERNEL is missing"
+TMP_MNTS=""; SB_DIR=""
+cleanup() { for m in $TMP_MNTS; do umount "$m" 2>/dev/null; rmdir "$m" 2>/dev/null; done; [ -z "$SB_DIR" ] || rm -rf "$SB_DIR"; }
+trap cleanup EXIT INT TERM
+
+# Secure Boot: sign the kernel and gather shim, MokManager and the key in SB_DIR (tools/secureboot.py esp) before anything is
+# written, as the user who ran sudo: the key lives in that user's home, and root's own home must not get a second key.
+is_kernel() { [ "$(dd if="$1" bs=1 skip=514 count=4 2>/dev/null)" = HdrS ]; }   # the x86 boot header; shim has none
+as_user() {
+  if [ "$(id -u)" = 0 ] && [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != root ]; then
+    sudo -u "$SUDO_USER" -H env ${GBOS_SB_KEYS:+GBOS_SB_KEYS="$GBOS_SB_KEYS"} "$@"
+  else "$@"; fi
+}
+SB=0; SB_WHY=""
+if [ "${SECURE_BOOT:-1}" = 0 ]; then SB_WHY="SECURE_BOOT=0"
+elif [ ! -f "$U/shim/shimx64.efi" ] || [ ! -f "$U/shim/mmx64.efi" ]; then SB_WHY="no shim in $U/shim (tools/fetch_shim.sh)"
+elif ! SB_WHY=$(python3 "$ROOT/tools/secureboot.py" check "$KERNEL" 2>&1 >/dev/null); then SB_WHY=${SB_WHY#secureboot: }
+elif [ $DRY_RUN -eq 1 ]; then SB=1
+else
+  SB_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gbos86-sb.XXXXXX")
+  [ "$(id -u)" = 0 ] && [ -n "$SUDO_USER" ] && chown "$SUDO_USER" "$SB_DIR"
+  if as_user python3 "$ROOT/tools/secureboot.py" esp "$SB_DIR" "$KERNEL"; then SB=1; else SB_WHY="signing the kernel failed (see above)"; fi
+fi
+[ $SB = 1 ] || warn "Secure Boot: $SB_WHY. The kernel is installed alone and unsigned: boot gbOS86 with Secure Boot off."
+# The boot files' sources: the signed kernel and shim's files, or the kernel alone. A dry run signs nothing: its sizes are estimates.
+if [ $SB = 0 ]; then BOOT_KERNEL=$KERNEL
+elif [ -n "$SB_DIR" ]; then BOOT_KERNEL=$SB_DIR/grubx64.efi
+else BOOT_KERNEL=$KERNEL; fi
+U_HOME=$HOME; [ "$(id -u)" = 0 ] && [ -n "$SUDO_USER" ] && U_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+KEY_CER=${GBOS_SB_KEYS:-$U_HOME/.config/gbos86/secureboot}/mok.cer   # the key's public half, for mokutil
+SB_FILES="mmx64.efi gbos86-mok.cer shim-COPYRIGHT.txt BOOTX64.EFI"   # after the kernel; shim (BOOTX64.EFI) last
+sb_src() { # name: the source of one of SB_FILES (in a dry run, usb/shim's; the key is a few hundred bytes)
+  if [ -n "$SB_DIR" ]; then echo "$SB_DIR/$1"; else case $1 in BOOTX64.EFI) echo "$U/shim/shimx64.efi";; shim-COPYRIGHT.txt) echo "$U/shim/COPYRIGHT";; gbos86-mok.cer) ;; *) echo "$U/shim/$1";; esac; fi
+}
+kb() { [ -f "$1" ] && echo $(( ($(stat -c %s "$1") + 1023) / 1024 )) || echo 0; }
 SUPER=""
 for s in "$ROOT/dist" "$ROOT/build"; do [ -f "$s/super.img" ] && [ -f "$s/super.layout" ] && { SUPER=$s; break; }; done
 if [ -z "$SUPER" ]; then
@@ -208,10 +249,7 @@ else
   [ $FORMAT_DATA = 1 ] && echo "  GBOS_DATA $DATA_PART will be formatted (gbOS86's apps and data are erased)"
 fi
 
-# The kernel has to fit on the EFI partition (it replaces an older EFI/gbos86/BOOTX64.EFI). Mount it read-only to look if needed.
-TMP_MNTS=""
-cleanup() { for m in $TMP_MNTS; do umount "$m" 2>/dev/null; rmdir "$m" 2>/dev/null; done; }
-trap cleanup EXIT INT TERM
+# The boot files have to fit on the EFI partition (they replace older ones of the same names). Mount it read-only to look.
 mount_part() { # dev [ro]: sets MP to its mount point. An existing mount is reused (for writing only if it is read-write).
   MP=$(findmnt -n -o TARGET --source "$1" 2>/dev/null | head -1)
   if [ -n "$MP" ]; then
@@ -222,22 +260,31 @@ mount_part() { # dev [ro]: sets MP to its mount point. An existing mount is reus
 }
 umount_part() { case " $TMP_MNTS " in *" $1 "*) umount "$1" && rmdir "$1"; TMP_MNTS=$(echo " $TMP_MNTS " | sed "s# $1 # #");; esac; }
 mount_part "$EFI_PART" ro || die "cannot mount $EFI_PART"; EFI_MNT=$MP
-K_KB=$(( $(stat -c %s "$KERNEL") / 1024 ))
-OLD_KB=0; [ -f "$EFI_MNT/EFI/gbos86/BOOTX64.EFI" ] && OLD_KB=$(( $(stat -c %s "$EFI_MNT/EFI/gbos86/BOOTX64.EFI") / 1024 ))
+# Layout (usb/install.sh's boot_layout ... keep): the kernel is EFI/gbos86/grubx64.efi when that is already there, or for a new
+# install with Secure Boot files; an install that boots the kernel as EFI/gbos86/BOOTX64.EFI keeps it there, signed, without shim.
+ED=$EFI_MNT/EFI/gbos86
+if [ -f "$ED/grubx64.efi" ] || { [ $SB = 1 ] && ! is_kernel "$ED/BOOTX64.EFI"; }; then KNAME=grubx64.efi; else KNAME=BOOTX64.EFI; fi
+SHIM=0; [ $SB = 1 ] && [ $KNAME = grubx64.efi ] && SHIM=1
+NEW_KB=$(( $(kb "$BOOT_KERNEL") + 4 )); OLD_KB=$(kb "$ED/$KNAME")   # +4: the signature
+if [ $SHIM = 1 ]; then for f in $SB_FILES; do NEW_KB=$(( NEW_KB + $(kb "$(sb_src $f)") + 4 )); OLD_KB=$(( OLD_KB + $(kb "$ED/$f") )); done; fi
 EFI_FREE_KB=$(df -kP "$EFI_MNT" | awk 'NR==2 {print $4}')
-[ $(( EFI_FREE_KB + OLD_KB )) -ge $(( K_KB + 1024 )) ] || die "$EFI_PART has $((EFI_FREE_KB / 1024)) MB free; the kernel needs $((K_KB / 1024 + 1)) MB. Nothing was changed."
-echo "  kernel -> $EFI_PART EFI/gbos86/BOOTX64.EFI ($((K_KB / 1024)) MB; $((EFI_FREE_KB / 1024)) MB free$([ $OLD_KB -gt 0 ] && echo ", replaces the existing one"))"
+[ $(( EFI_FREE_KB + OLD_KB )) -ge $(( NEW_KB + 1024 )) ] || die "$EFI_PART has $((EFI_FREE_KB / 1024)) MB free; the boot files need $((NEW_KB / 1024 + 1)) MB$([ $OLD_KB -gt 0 ] && echo " ($((OLD_KB / 1024)) MB of it is freed by the files they replace)"). Nothing was changed."
+if [ $SHIM = 1 ]; then echo "  boot files -> $EFI_PART EFI/gbos86/: BOOTX64.EFI (shim), grubx64.efi (the kernel, signed), mmx64.efi (MokManager), gbos86-mok.cer (the key)"
+elif [ $SB = 1 ]; then echo "  kernel -> $EFI_PART EFI/gbos86/BOOTX64.EFI, signed; no shim: this install already boots the kernel as that file"
+else echo "  kernel -> $EFI_PART EFI/gbos86/$KNAME, unsigned$([ $KNAME = grubx64.efi ] && echo " (the shim already there stays: with Secure Boot on it refuses this kernel)")"; fi
+echo "    $((NEW_KB / 1024)) MB, $((EFI_FREE_KB / 1024)) MB free$([ $OLD_KB -gt 0 ] && echo ", replaces the existing files")"
 umount_part "$EFI_MNT"
 
-# GRUB: an entry that boots EFI/gbos86/BOOTX64.EFI from this ESP (as usb/install.sh writes it) or chainloads this GBOSSYS is
-# current; any other "Googlebook OS" entry is stale (an older install) and is reported, not edited.
+# GRUB: an entry that boots the kernel (EFI/gbos86/$KNAME) from this ESP (as usb/install.sh writes it) or chainloads this
+# GBOSSYS's EFI/BOOT/BOOTX64.EFI (shim or the kernel, see below) is current; any other "Googlebook OS" entry is stale (an older
+# install; with shim, one that names EFI/gbos86/BOOTX64.EFI would start shim as a kernel) and is reported, not edited.
 GRUB_DIR=""; GRUB_FILE=""; GRUB_STALE=""; GRUB_OK=""
 if [ $DO_GRUB = 1 ]; then
   for g in "$GR/boot/grub" "$GR/boot/grub2"; do [ -f "$g/grub.cfg" ] && { GRUB_DIR=$g; break; }; done
   SYS_UUID=""; [ -n "$SYS_PART" ] && [ $FORMAT_SYS = 0 ] && SYS_UUID=$(blkid -s UUID -o value "$SYS_PART" 2>/dev/null || true)
   for f in "$GRUB_DIR/custom.cfg" "$GR/etc/grub.d/40_custom"; do
     [ -f "$f" ] && grep -q "Googlebook OS" "$f" 2>/dev/null || continue
-    if { [ -n "$ESP_UUID" ] && grep -q -- "--fs-uuid --set=root $ESP_UUID" "$f" && grep -q "/EFI/gbos86/BOOTX64.EFI" "$f"; } || \
+    if { [ -n "$ESP_UUID" ] && grep -q -- "--fs-uuid --set=root $ESP_UUID" "$f" && grep -q "linux /EFI/gbos86/$KNAME" "$f"; } || \
        { [ -n "$SYS_UUID" ] && grep -q -- "--fs-uuid --set=root $SYS_UUID" "$f" && grep -q "chainloader /EFI/BOOT/BOOTX64.EFI" "$f"; }; then
       GRUB_OK="$GRUB_OK $f"
     else
@@ -325,7 +372,8 @@ mount_part "$SYS_PART" || die "cannot mount $SYS_PART"; MNT_SYS=$MP
 LOG=$MNT_SYS/gbos/logs/dualboot-install.txt
 mkdir -p "$MNT_SYS/EFI/BOOT" "$MNT_SYS/gbos/logs"
 { echo "== $(date -u '+%Y-%m-%d %H:%M:%S UTC') install_dualboot.sh $(git -c safe.directory="$ROOT" -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
-  echo "target $TARGET_DISK  efi $EFI_PART  sys $SYS_PART  meta ${META_PART:-none}  data $DATA_PART  formatted sys=$FORMAT_SYS meta=$FORMAT_META data=$FORMAT_DATA"; } >> "$LOG"
+  echo "target $TARGET_DISK  efi $EFI_PART  sys $SYS_PART  meta ${META_PART:-none}  data $DATA_PART  formatted sys=$FORMAT_SYS meta=$FORMAT_META data=$FORMAT_DATA"
+  echo "boot EFI/gbos86/$KNAME = kernel ($([ $SB = 1 ] && echo signed || echo "unsigned: $SB_WHY")), shim $([ $SHIM = 1 ] && echo yes || echo no)"; } >> "$LOG"
 
 # Create loopback metadata.img if physical GBOS_META partition is absent
 if [ -z "$META_PART" ] && [ ! -f "$MNT_SYS/gbos/metadata.img" ]; then
@@ -335,7 +383,15 @@ if [ -z "$META_PART" ] && [ ! -f "$MNT_SYS/gbos/metadata.img" ]; then
 fi
 
 say "Copying system files to $SYS_PART (GBOSSYS)..."
-cp "$KERNEL" "$MNT_SYS/EFI/BOOT/BOOTX64.EFI"
+# GBOSSYS's own EFI/BOOT: what an older GRUB entry chainloads and what some firmware adds a boot entry for by itself. It is
+# gbOS86's partition, so it always gets the full layout: shim + the signed kernel, or the kernel alone (shim's files removed).
+if [ $SB = 1 ]; then
+  cp "$BOOT_KERNEL" "$MNT_SYS/EFI/BOOT/grubx64.efi"
+  for f in $SB_FILES; do cp "$SB_DIR/$f" "$MNT_SYS/EFI/BOOT/$f"; done
+else
+  cp "$KERNEL" "$MNT_SYS/EFI/BOOT/BOOTX64.EFI"
+  rm -f "$MNT_SYS/EFI/BOOT/grubx64.efi" "$MNT_SYS/EFI/BOOT/mmx64.efi" "$MNT_SYS/EFI/BOOT/gbos86-mok.cer" "$MNT_SYS/EFI/BOOT/shim-COPYRIGHT.txt"
+fi
 [ -f "$ROOT/kernel/out/busybox" ] && cp "$ROOT/kernel/out/busybox" "$MNT_SYS/busybox"
 
 for f in hook.sh optimize.sh aidiag.sh native_zygote.sh early_patch.sh hwdetect.sh install.sh apex_patch.sh gbos.cfg \
@@ -386,14 +442,22 @@ if [ "$AUTO_TAILOR" = 1 ]; then
   fi
 fi
 
-# The kernel on the EFI partition: only EFI/gbos86/ is written.
-mount_part "$EFI_PART" || die "cannot mount $EFI_PART read-write"; EFI_MNT=$MP
-mkdir -p "$EFI_MNT/EFI/gbos86"
-cp "$KERNEL" "$EFI_MNT/EFI/gbos86/BOOTX64.EFI"
-[ -f "$U/Add-gbOS-to-Windows-BootMenu.bat" ] && cp "$U/Add-gbOS-to-Windows-BootMenu.bat" "$EFI_MNT/EFI/gbos86/" 2>/dev/null || true
+# The boot files on the EFI partition: only EFI/gbos86/ is written. The kernel first: until shim replaces an older kernel as
+# BOOTX64.EFI, that one still boots.
+mount_part "$EFI_PART" || die "cannot mount $EFI_PART read-write"; EFI_MNT=$MP; ED=$EFI_MNT/EFI/gbos86
+mkdir -p "$ED"
+boot_files() { # FN: FN SOURCE NAME for each boot file, the kernel first
+  $1 "$BOOT_KERNEL" $KNAME
+  [ $SHIM = 0 ] || for f in $SB_FILES; do $1 "$SB_DIR/$f" $f; done
+}
+put_file() { cmp -s "$1" "$ED/$2" || cp "$1" "$ED/$2" || die "copying $2 to $EFI_PART failed"; }
+check_file() { cmp -s "$1" "$ED/$2" || die "EFI/gbos86/$2 on $EFI_PART does not match $1"; }
+boot_files put_file
+[ -f "$U/Add-gbOS-to-Windows-BootMenu.bat" ] && cp "$U/Add-gbOS-to-Windows-BootMenu.bat" "$ED/" 2>/dev/null || true
 sync
-cmp -s "$KERNEL" "$EFI_MNT/EFI/gbos86/BOOTX64.EFI" || die "the kernel on $EFI_PART does not match $KERNEL"
-say "Installed the kernel to $EFI_PART -> EFI/gbos86/BOOTX64.EFI"
+boot_files check_file
+if [ $SHIM = 1 ]; then say "Installed the boot files to $EFI_PART -> EFI/gbos86/: BOOTX64.EFI (shim), grubx64.efi (the kernel, signed), mmx64.efi, gbos86-mok.cer"
+else say "Installed the kernel to $EFI_PART -> EFI/gbos86/$KNAME ($([ $SB = 1 ] && echo signed || echo unsigned))"; fi
 umount_part "$EFI_MNT"
 
 # UEFI boot entry. efibootmgr -c puts a new entry first in BootOrder; unless --boot-first, the old order is restored with
@@ -424,7 +488,7 @@ menuentry "$GRUB_LABEL" --class android --class os {
     insmod part_gpt
     insmod fat
     search --no-floppy --fs-uuid --set=root $ESP_UUID
-    linux /EFI/gbos86/BOOTX64.EFI $GRUB_ARGS
+    linux /EFI/gbos86/$KNAME $GRUB_ARGS
 }
 GRUB_EOF
   say "Added '$GRUB_LABEL' to $GRUB_FILE (the previous file is $GRUB_FILE.gbos-bak)"
@@ -443,3 +507,11 @@ sync
 umount_part "$MNT_SYS"
 say "gbOS86 dual-boot installation complete!"
 echo "Reboot and select '$GRUB_LABEL' in GRUB, or in the UEFI boot menu."
+if [ $SHIM = 1 ]; then
+  echo "Secure Boot can stay on. The first boot of the UEFI entry with it asks once to enroll the gbOS86 key (README \"Secure Boot\":"
+  echo "MokManager, Enroll key from disk, EFI/gbos86/gbos86-mok.cer). To boot it from GRUB first, enroll the key from here instead:"
+  echo "  sudo mokutil --import $KEY_CER"
+elif [ $SB = 1 ]; then
+  echo "Secure Boot: the kernel is signed, but this install has no shim (it boots EFI/gbos86/BOOTX64.EFI as the kernel). With Secure"
+  echo "Boot on, boot it from GRUB after enrolling the key: sudo mokutil --import $KEY_CER"
+fi

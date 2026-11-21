@@ -382,12 +382,13 @@ On a machine that already runs Linux, `build.sh` can install into the disk's una
 ./build.sh --dualboot --target /dev/nvme0n1 --allow-internal --allow-root --sys-size 8G --data-size rest
 ```
 It downloads and builds as usual, then runs `sudo tools/install_dualboot.sh`, which adds `GBOSSYS`, `GBOS_META` and `GBOS_DATA`
-back to back in the largest free block (`--data-size rest` = all of what is left), copies the kernel to the existing EFI partition
-as `EFI/gbos86/BOOTX64.EFI` (nothing else there is touched), adds a GRUB entry (left alone when a working one exists; an older,
-broken one is reported, not edited) and a UEFI boot entry appended to BootOrder (`--boot-first` puts it first, `--no-nvram` /
-`--no-grub` skip either). Everything is checked before the first write and partitioning asks for the disk's serial. Running the
-same command again only updates the files (no format unless `--reformat`, which also asks for the serial). Preview with
-`sudo sh tools/install_dualboot.sh --target ... --dry-run`. `sudo sh tools/test_install_dualboot.sh` tests it on a loop device.
+back to back in the largest free block (`--data-size rest` = all of what is left), copies the boot files to the existing EFI
+partition's `EFI/gbos86/` (shim and the signed kernel, see [Secure Boot](#secure-boot); nothing else there is touched), adds a
+GRUB entry (left alone when a working one exists; an older, broken one is reported, not edited) and a UEFI boot entry appended to
+BootOrder (`--boot-first` puts it first, `--no-nvram` / `--no-grub` skip either). Everything is checked before the first write and
+partitioning asks for the disk's serial. Running the same command again only updates the files (no format unless `--reformat`,
+which also asks for the serial). Preview with `sudo sh tools/install_dualboot.sh --target ... --dry-run`. `sudo sh
+tools/test_install_dualboot.sh` tests it on a loop device.
 
 ### Secure Boot
 Secure Boot can stay on, with a kernel built from kernel #47 on (its `.sbat` section comes from `kernel/sbat.csv`). Tested in QEMU/OVMF
@@ -412,7 +413,10 @@ signs the kernel with it, and the image carries its public half as `EFI/BOOT/gbo
   boot entry and the Windows boot-menu entry (both start `BOOTX64.EFI`) start shim. A dual-boot install made before this keeps its kernel
   as `EFI/gbos86/BOOTX64.EFI`, because GRUB entries on the other system name that file: it gets the signed kernel but no shim. With Secure
   Boot on, boot it from a GRUB that runs under shim (Ubuntu, Fedora: enroll the key there with `sudo mokutil --import gbos86-mok.cer`).
-  `./build.sh --dualboot` (`tools/install_dualboot.sh`, run from Linux) still installs the unsigned kernel alone, as before.
+  `./build.sh --dualboot` (`tools/install_dualboot.sh`, run from Linux) follows the same rule in `EFI/gbos86/`, signs with the key of
+  the user who ran it (not root's), writes a GRUB entry for `grubx64.efi` (or `BOOTX64.EFI` for an install made before), and gives
+  gbOS86's own `GBOSSYS` the shim layout in `EFI/BOOT/` too (what an older `chainloader` GRUB entry and some firmware boot entries
+  start). With a kernel without `.sbat` or `SECURE_BOOT=0` it installs the unsigned kernel alone, with a warning.
 - Secure Boot checks the boot chain only. The kernel has no lockdown LSM, so nothing changes once it runs (modules, KernelSU, debugfs),
   and SELinux is still permissive (see [Safety](#safety)).
 - Developers: after `kernel/build_kernel.sh`, `python3 tools/secureboot.py esp /Volumes/EFI/EFI/BOOT` signs the kernel and writes shim,

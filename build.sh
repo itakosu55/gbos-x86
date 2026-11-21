@@ -270,7 +270,9 @@ if [ "$BUILD_TYPE" = "dualboot" ]; then
   [ "$AUTO_TAILOR" = 1 ] && EXTRA_FLAGS="$EXTRA_FLAGS --auto"
   [ "$(uname -s)" = Linux ] || die "--dualboot partitions a disk with Linux tools (sgdisk, lsblk): run it from Linux"
   case "$DATA_GB" in *[!0-9]*) DATA_ARG=$DATA_GB;; *) DATA_ARG=${DATA_GB}G;; esac   # "rest" = the rest of the free space
-  sudo sh tools/install_dualboot.sh --target "$TARGET_DISK" --data-size "$DATA_ARG" $EXTRA_FLAGS
+  # sudo drops the environment: SECURE_BOOT=0 and GBOS_SB_KEYS (README "Secure Boot") are passed on explicitly
+  sudo env SECURE_BOOT="${SECURE_BOOT:-1}" ${GBOS_SB_KEYS:+GBOS_SB_KEYS="$GBOS_SB_KEYS"} \
+    sh tools/install_dualboot.sh --target "$TARGET_DISK" --data-size "$DATA_ARG" $EXTRA_FLAGS
 else
   say "4/4 building the image ($BUILD_TYPE)"
   MAKE_FLAGS="--type $BUILD_TYPE --data-size $DATA_GB"
