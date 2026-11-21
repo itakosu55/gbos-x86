@@ -95,6 +95,8 @@ make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 \\
 sh /host/kernel/make_stage0_initramfs.sh /build/modroot_all /build/out/gbos_stage0.cpio
 /build/src/scripts/config --file /build/out/.config --set-str INITRAMFS_SOURCE /build/out/gbos_stage0.cpio
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 olddefconfig > /dev/null
+# Every vmlinux link bumps .version: step 3 already used #prev+1, so put the number back for the shipped (second) link.
+[ -z "\$prev" ] || echo "\$prev" > /build/out/.version
 make -C /build/src O=/build/out ARCH=x86_64 LLVM=$C/bin/ CC=$C/bin/clang-22 -j$JOBS bzImage
 python3 /host/tools/secureboot.py check /build/out/arch/x86/boot/bzImage
 echo "BUILD OK"
