@@ -65,11 +65,11 @@ Fedora/RHEL with SELinux enforcing: the scripts add `:z` to the docker bind moun
 | Screen-lock password | Software Gatekeeper (`gatekeeper/soft_gk.c`) |
 | Root for apps (KernelSU) | Built into the kernel; the manager app is installed on first boot, root is granted per app in it |
 | Correct display colours / black levels | Kernel #29: i915 ignores the HWC's gamma tables (see below) |
+| Night Light | Works on i915's client-composition path: SurfaceFlinger applies Android's colour transform during GPU composition, before KMS; verified on a ThinkPad X13 Gen 1 |
 
 | Not done / limited | |
 |---|---|
 | Speed | Some instructions are still emulated in the kernel (see "Why it's slow") |
-| Night Light | Gamma tables from userspace are ignored (that's the colour fix), so it has no effect |
 | Linux Terminal (AVF) | Secretkeeper hang fixed; VM boot not yet confirmed |
 | Auth-bound keystore keys | `soft_gk`'s auth tokens aren't trusted by the software KeyMint |
 | Google's on-device AI (Magic Pointer, AICore) | Google's servers refuse it without hardware key attestation, which no non-Google laptop can provide |
@@ -425,6 +425,23 @@ The system writes logs to its own `GBOSSYS` (or `GBOS`) partition. To read them,
 menu **2**, then **3 (Only save its logs)** (or 1 to update too), and read `gbos/logs/boot-N/nvme-logs/` on the stick from a computer. Each boot dir has
 `kmsg.log`, `stage0-dmesg.txt`, rotated `logcat.txt*`, `crash.txt`, `hw.txt`, `audio.txt`, and `pstore-prev/`.
 FAT has no journal: always shut down from Android's power menu, not the physical power button.
+
+### Play Store closes a second or two after opening
+If `logcat | grep com.android.vending` (rooted terminal) shows the Store being killed in a loop with
+
+```
+Killing <pid>:com.android.vending/...: depends on provider <pkg>/<provider> in dying proc <pkg>
+```
+
+then Android is killing the Store because an app it is bound to (a content-provider client) keeps dying. That is
+not a gbOS86 fault. The case seen so far (2026-11-20, Ice Lake, R5) was a user-installed **Zygisk module plus its
+companion app** ("Play Integrity Break": `it.eldavo.pib` / `icu.nullptr.playintegritybreak`, which logs
+`Integrity hooks installed in com.android.vending (Zygisk)`) whose provider process was dead each time, so every
+Store launch was killed about 2 s in. gbOS86 ships no Zygisk and no Play Integrity module (the Trusty-backed
+KeyMint/attestation services never answer on this hardware, so such modules are unsupported here). Uninstall or
+disable the module and its app, clear the Store's data, and reboot. If the Store still closes, post the
+unfiltered log of the crash (`logcat -b all -d > /sdcard/logcat.txt`, taken right after one failed launch) and the
+`logs/boot-N/` folder, not a `grep` of the package name, which hides the actual crash.
 
 ### Display size
 Density stays Google's stock 260. `RESOLUTION=2400x1350` in `gbos.cfg` makes Android render at a larger
