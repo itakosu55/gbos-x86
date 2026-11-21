@@ -259,6 +259,11 @@ gbos_gpu_enable() {
 # Let the DRM driver (amdgpu probes for several seconds and loads ~20 firmware files) finish before deciding.
 gbos_gpu_decide ${GPU_WAIT:-25}
 [ "$GPU_SW" = 1 ] && gbos_gpu_enable
+# CPU governor/EPP after boot (gbos_cpu_power in optimize.sh, CPURC below): "performance" only when the CPU draws every frame or
+# CPU_PERFORMANCE=1 in gbos.cfg; otherwise Google's powertool default. ro.gbos.cpu_performance=1 (vendor build.prop) tells optimize.sh.
+CPUPERF=0
+if [ "$GPU_SW" = 1 ] || [ "${CPU_PERFORMANCE:-0}" = 1 ]; then CPUPERF=1; fi
+log "hook: CPU after boot: $([ $CPUPERF = 1 ] && echo "performance (software rendering=${GPU_SW:-0}, CPU_PERFORMANCE=${CPU_PERFORMANCE:-0})" || echo "Google's powertool default")"
 
 # Set up DRM device nodes cleanly before switch_root
 gbos_drm_setup() {
@@ -293,7 +298,8 @@ gbos_drm_setup() {
 }
 gbos_drm_setup
 
-# Maximize CPU governor early to prevent throttling during init and software rendering
+# Full CPU speed while Android boots, on every machine. Only for the boot: at boot_completed gbos.rc hands the CPUs back to Google's
+# powertool (optimize.sh cpu balanced, see gbos_cpu_power there), except in software rendering or with CPU_PERFORMANCE=1 in gbos.cfg.
 for _g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
   echo performance > "$_g" 2>/dev/null || true
 done
@@ -363,6 +369,11 @@ if mount --bind /gbos /new/postinstall; then
   # The Trusty security VM never answers here (software KeyMint/Gatekeeper replace it) but spins one CPU core at 100%: stopped once
   # booted. TRUSTY_VM=1 in gbos.cfg keeps it running (for debugging).
   if [ "${TRUSTY_VM:-0}" = 1 ]; then TRUSTYSTOP="# gbos: Trusty VM kept (TRUSTY_VM=1)"; else TRUSTYSTOP="stop trusty_security_protected_vm_launcher"; fi
+  # CPU governor/EPP after boot (gbos_cpu_power in optimize.sh): with a hardware GPU, undo the boot-time "performance" (above) at
+  # boot_completed. exec, so it is done before powertool's own boot_completed exec (vendor rc), which then sets Google's default.
+  # Software rendering or CPU_PERFORMANCE=1: kept at "performance" (optimize.sh re-applies it after powertool).
+  if [ "$CPUPERF" = 1 ]; then CPURC="# gbos: CPU kept at performance (software rendering or CPU_PERFORMANCE=1), see optimize.sh"
+  else CPURC="exec u:r:shell:s0 root root -- /system/bin/sh /postinstall/gbos/optimize.sh cpu balanced"; fi
   # Surface Laptop 7 daemons (camera bridge, lid/sleep guard): started only on a Surface. gbos_sleep_guard is not oneshot (it is a daemon on
   # a Surface), so on any other laptop it exited at once and init restarted it every 5 s for as long as the system ran.
   if grep -qi 'Surface' /sys/class/dmi/id/product_name 2>/dev/null; then SURFACESTART="start gbos_camera
@@ -444,11 +455,8 @@ on property:sys.boot_completed=1
     write /sys/kernel/tracing/tracing_on 0
     # Speakup synth hardware probe causes kernel panic if unassigned
     write /sys/accessibility/speakup/synth none
-    # Maximize CPU frequency governor permanently
-    write /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor performance
-    write /sys/devices/system/cpu/cpu1/cpufreq/scaling_governor performance
-    write /sys/devices/system/cpu/cpu2/cpufreq/scaling_governor performance
-    write /sys/devices/system/cpu/cpu3/cpufreq/scaling_governor performance
+    # CPU governor/EPP back to Google's powertool (hardware GPU), see CPURC in hook.sh.
+    $CPURC
     $TRUSTYSTOP
     start gbos_skip_setup
     start gbos_optimize
@@ -459,6 +467,7 @@ on property:sys.boot_completed=1
     $SURFACESTART
     start gbos_wmsize
     start gbos_displaydiag
+    start gbos_powerdiag
     start gbos_aidiag
     start gbos_ksu
 
@@ -552,6 +561,16 @@ service gbos_displaydiag /system/bin/sh -c "sleep 70; ( mount -t debugfs debugfs
     group root graphics
     seclabel u:r:shell:s0
     oneshot
+
+# CPU power and temperature, 90 s after boot (HANDOFF.md 2026-11-17): cpufreq driver/governor/EPP per policy (gbos_cpu_power in optimize.sh,
+# then Google's powertool), the thermal zones the kernel has and their temperatures (millidegrees C), the gbos-cpu kernel log lines,
+# the thermal/power properties, and what Android's thermal HAL reports. No shell variables here: init reads $ in an .rc line as a property.
+service gbos_powerdiag /system/bin/sh -c "sleep 90; ( grep . /sys/devices/system/cpu/intel_pstate/status /sys/devices/system/cpu/intel_pstate/no_turbo /sys/devices/system/cpu/cpufreq/policy*/scaling_driver /sys/devices/system/cpu/cpufreq/policy*/scaling_governor /sys/devices/system/cpu/cpufreq/policy*/energy_performance_preference /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq /sys/class/thermal/thermal_zone*/type /sys/class/thermal/thermal_zone*/temp; dmesg | grep -E 'gbos-cpu|x86_pkg_temp'; getprop | grep -E 'thermal|powertool|powerhal|gbos'; dumpsys thermalservice ) > /postinstall/gbos/logs/boot-$N/power.txt 2>&1"
+    user root
+    group root
+    seclabel u:r:shell:s0
+    oneshot
+    disabled
 
 # Touchpad gestures on the Surface Laptop 7: iptsd (a fork) turns the touchpad's raw frames into a multitouch uinput device.
 # The script exits at once without surface/iptsd on the stick and when the machine has no such touchpad; oneshot so init does not restart it.
@@ -790,6 +809,8 @@ DROP='^ro.boot.hypervisor.protected_vm.supported=|^ro.surface_flinger.has_wide_c
     echo "debug.sf.enable_gl_backpressure=0"
     echo "debug.sf.rounded_corner_opaque_optimization=true"
   fi
+  # Read by optimize.sh (gbos_cpu_power): keep the CPU at "performance" after boot.
+  if [ "$CPUPERF" = 1 ]; then echo "ro.gbos.cpu_performance=1"; fi
   if [ -n "$DENSITY" ]; then echo "ro.sf.lcd_density=$DENSITY"; fi
   if [ -n "$DEVICE_MODEL" ]; then
     echo "ro.product.model=$DEVICE_MODEL"
@@ -850,6 +871,48 @@ fi
 F=/new/vendor/etc/fstab.android-desktop
 grep -v 'voldmanaged=usb' $F > /tmp/fstab.android-desktop \
   && mount --bind /tmp/fstab.android-desktop $F && log "hook: vold USB rule removed from fstab"
+# --- thermal HAL config (tested by tools/test_power.sh) ---
+# Google's thermal HAL (android.hardware.thermal-service.pixel) reads /vendor/etc/thermal_info_config.json unless set_pnp_config finds
+# a file for the board model (vendor.thermal.config), and that default has "Sensors":[] ("Empty thermal configuration to be filled
+# later on"): Android knew no temperature at all ("ThermalHal cannot read any sensor data", HANDOFF.md 2026-11-17). Give it the CPU
+# package sensor when the kernel has one (x86_pkg_temp_thermal: a thermal zone of type x86_pkg_temp, which the vendor thermal_symlinks
+# script links into /dev/thermal/tz-by-name/). Report only: every threshold is NAN, so Android never throttles or powers off because
+# of it (a CPU sensor reaching its SHUTDOWN threshold makes ThermalManagerService shut down, and Intel CPUs run at 95-100 C under
+# load by design); the CPU's own thermal control stays in charge. Nothing is bound without the zone: the HAL rejects a config whose
+# sensor it cannot find. THERMAL_HAL=0 in gbos.cfg keeps Google's file. THERMAL= is only for tests.
+gbos_thermal_config() {
+  for _tz in "${THERMAL:-/sys/class/thermal}"/thermal_zone*; do
+    [ "$(cat "$_tz/type" 2>/dev/null)" = x86_pkg_temp ] || continue
+    cat <<'JSON'
+{
+    "Comment": "gbOS86 (usb/hook.sh): CPU package temperature from x86_pkg_temp_thermal, reported only (no thresholds)",
+    "Sensors": [
+        {
+            "Name": "x86_pkg_temp",
+            "Type": "CPU",
+            "HotThreshold": ["NAN", "NAN", "NAN", "NAN", "NAN", "NAN", "NAN"],
+            "Multiplier": 0.001,
+            "Monitor": false
+        }
+    ]
+}
+JSON
+    return 0
+  done
+  return 1
+}
+# --- end thermal HAL config ---
+TC=/new/vendor/etc/thermal_info_config.json
+if [ "${THERMAL_HAL:-1}" = 0 ]; then
+  log "hook: thermal HAL: Google's empty config kept (THERMAL_HAL=0)"
+elif [ ! -f $TC ]; then
+  log "hook: thermal HAL: no $TC in this Google build, nothing bound"
+elif gbos_thermal_config > /tmp/thermal_info_config.json; then
+  mount --bind /tmp/thermal_info_config.json $TC && log "hook: thermal HAL: CPU package sensor x86_pkg_temp (report only)" \
+    || log "hook: thermal HAL: bind of $TC FAILED"
+else
+  log "hook: thermal HAL: no x86_pkg_temp thermal zone (zones: $(cat /sys/class/thermal/thermal_zone*/type 2>/dev/null | tr '\n' ' ')), Google's empty config kept"
+fi
 # Audio: the audio HAL (dras) needs a config whose <soundcard> equals the ALSA card id. Google ships only its SOF
 # SoundWire card; gbos/audio/gbos-hda-pch is the legacy-HDA one (card id PCH, true for nearly every Intel PCH HDA
 # laptop). For any other main card (SOF: sof-hda-dsp, sof-rt5682, ...) a copy is generated with that card's id and

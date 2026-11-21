@@ -84,10 +84,32 @@ gbos_modopts() {
   log "hwdetect: configured modprobe options from MODOPTS"
 }
 
-# One coldplug pass: all modaliases, de-duplicated, to a single modprobe (it reads modules.alias once).
+# --- long modaliases (tested by tools/test_power.sh) ---
+# busybox modprobe cuts every name it is given to 55 characters (MODULE_NAME_LEN - 1) and at the first '.', and the alias patterns
+# too, before it matches them. A modalias longer than that, or with a dot, only matches aliases that look no further than its start:
+# the CPU one (~900 characters of feature numbers) never loaded x86_pkg_temp_thermal (feature 01C6: the CPU package temperature,
+# which Android's thermal HAL reads) while intel_rapl_common (family/model only) did, and the DMI one (vendor and BIOS strings,
+# dots in version numbers) never loads dell_laptop, dell_pc, dcdbas or samsung_laptop (HANDOFF.md 2026-11-17). udev/kmod match the
+# whole string; do that here for those modaliases. stdin: modaliases, one per line; prints the matching module names.
+# MODALIASES_FILE= is only for tests.
+gbos_long_modaliases() {
+  _lm_al=${MODALIASES_FILE:-/lib/modules/$(uname -r)/modules.alias}
+  awk 'length($0) > 55 || index($0, ".")' | while read -r _lm_ma; do
+    grep "^alias ${_lm_ma%%:*}" "$_lm_al" 2>/dev/null | while read -r _lm_x _lm_pat _lm_mod; do
+      case "$_lm_ma" in $_lm_pat) echo "$_lm_mod";; esac
+    done
+  done | sort -u
+}
+# --- end long modaliases ---
+
+# One coldplug pass: all modaliases, de-duplicated, to a single modprobe (it reads modules.alias once), then the modules that only a
+# match on the whole of a long modalias finds, by name (-b: MODOPTS blacklist= still applies).
 gbos_coldplug_pass() {
-  find /sys/devices -name modalias 2>/dev/null | xargs cat 2>/dev/null | sort -u \
-    | xargs modprobe -a -q 2>/dev/null
+  _cp_ma=$(find /sys/devices -name modalias 2>/dev/null | xargs cat 2>/dev/null | sort -u)
+  echo "$_cp_ma" | xargs modprobe -a -q 2>/dev/null
+  GBOS_LONG_MODS=$(echo "$_cp_ma" | gbos_long_modaliases)
+  if [ -n "$GBOS_LONG_MODS" ]; then modprobe -a -q -b $GBOS_LONG_MODS 2>/dev/null; fi
+  return 0
 }
 
 gbos_coldplug() {
@@ -102,6 +124,12 @@ gbos_coldplug() {
     [ $now -eq $before ] && break
     before=$now; p=$((p+1))
   done
+  # gbos_hwdetect chains gbos_coldplug && gbos_wait_devices: this function must return 0.
+  if [ -n "$GBOS_LONG_MODS" ]; then
+    log "hwdetect: long modaliases matched: $(for m in $GBOS_LONG_MODS; do
+      grep -q "^$m " /proc/modules && printf '%s ' "$m" || printf '%s(not loaded) ' "$m"; done)"
+  fi
+  return 0
 }
 
 # Give drivers time to finish probing and pull their firmware (Wi-Fi, Bluetooth, audio DSP).
