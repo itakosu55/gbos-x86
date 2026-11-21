@@ -124,6 +124,7 @@ UEFI firmware
 | keystore2 aborts / KeyMint hangs | Trusty/StrongBox KeyMint need the GSC | patched `libkm_compat.so` (software KeyMint), StrongBox APEX hidden |
 | Linux Terminal never starts its VM | Trusty Secretkeeper never answers | hide Secretkeeper's VINTF declaration |
 | Logs truncated, stick corrupted | vold `fsck_msdos`'d the stick while mounted | remove vold's `voldmanaged=usb` fstab rule |
+| `FAT-fs ... Volume was not properly unmounted` and `GBOS_META: recovering journal` on every boot | init's shutdown only unmounts `/dev/block/*` mounts; stage0 mounts GBOSSYS and GBOS_META by their `/dev/nvme*` names, its log copier writes until power-off, and the writable loop on `gbos/bootdisk.img` (misc) keeps the FAT busy | `usb/shutdown.sh` at `on shutdown`: stops the log writers, detaches that loop, remounts both read-only (`SHUTDOWN_RO=0` in `gbos.cfg` turns it off; `logs/boot-N/shutdown.txt` says what blocked it). Linux never clears a FAT dirty bit that was already set when it mounted, so after one unclean shutdown the warning stays until `sudo fsck.fat -a /dev/<GBOSSYS partition>` from another Linux with it unmounted |
 | No sound | Google uses SOF; our kernel has legacy HDA | `usb/audio/` config for the `dras` audio HAL (card id `PCH`) |
 | White veil, lifted blacks (even video) | drm_hwcomposer loads its xe `LOG_GAMMA_LUT` curve into i915's linear `GAMMA_LUT` every frame | `kernel/isa_emu_patch/i915_ignore_gamma.sh` (kernel #29) |
 | Everything too big | `ro.sf.lcd_density=260` for Google's panel | `RESOLUTION` in `gbos.cfg` (default 2400x1350, stock density); `DENSITY` optional |
@@ -307,7 +308,7 @@ driver inside Google's userspace under QEMU.
 | `kernel/build_kernel.sh` | builds the whole kernel (patches, config, modules, initramfs) in the `gbos-kbuild` container |
 | `kernel/stage0_modules.txt` | the modules the stage0 initramfs carries (see `kernel/make_stage0_initramfs.sh`) |
 | `kernel/ashmem_shim/` | C memfd ashmem shim |
-| `kernel/isa_emu_test/` | QEMU tests: the emulator (16 instructions), `run_isa_qemu.py` and `run_ksu_qemu.py` (KernelSU in the kernel), hwdetect, `run_installer_emmc.py` (installer on an emulated eMMC) and `run_installer_sata.py` (on emulated SATA disks) |
+| `kernel/isa_emu_test/` | QEMU tests: the emulator (16 instructions), `run_isa_qemu.py` and `run_ksu_qemu.py` (KernelSU in the kernel), hwdetect, `run_installer_emmc.py` (installer on an emulated eMMC), `run_installer_sata.py` (on emulated SATA disks) and `run_shutdown_qemu.py` (GBOSSYS and /metadata come back clean after `usb/shutdown.sh`) |
 | `isa-emu/` | emulator core + host known-answer tests |
 | `tools/` | image extraction (`lp_extract.py`), ISA scanner (`isa_scan.py`), binary patchers, and the new-build porting tools (`port_build.sh`, `check_new_build.sh`, see [`porting.md`](porting.md)) |
 | `lapis/BUILD` | the Google build this repo is ported to (id, version, download URL) |
@@ -390,7 +391,9 @@ During installation, live progress bars indicate system image and driver/firmwar
 The system writes logs to its own `GBOSSYS` (or `GBOS`) partition. To read them, boot the stick, choose
 menu **2**, then **3 (Only save its logs)** (or 1 to update too), and read `gbos/logs/boot-N/nvme-logs/` on the stick from a computer. Each boot dir has
 `kmsg.log`, `stage0-dmesg.txt`, rotated `logcat.txt*`, `crash.txt`, `hw.txt`, `audio.txt`, and `pstore-prev/`.
-FAT has no journal: always shut down from Android's power menu, not the physical power button.
+FAT has no journal: always shut down from Android's power menu, not the physical power button. On a clean power-off or reboot,
+`usb/shutdown.sh` remounts the partition read-only, so `kmsg.log` and `logcat.txt` end there and `shutdown.txt` is the last file written
+(set `SHUTDOWN_RO=0` to log the rest of the shutdown, at the cost of a dirty FAT).
 
 ### Play Store closes a second or two after opening
 If `logcat | grep com.android.vending` (rooted terminal) shows the Store being killed in a loop with
