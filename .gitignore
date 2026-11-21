@@ -39,8 +39,15 @@
 *.o
 __pycache__/
 
-# Logs and run markers
+# Secure Boot signing key: tools/secureboot.py keeps it outside the repository (~/.config/gbos86/secureboot); never commit one
+mok.key
+mok.crt
+mok.cer
+gbos86-mok.cer
+
+# Logs and run markers (and the screens kernel/isa_emu_test/run_secureboot_qemu.py saves)
 *.log
+last-secureboot-*.png
 *.done
 
 # Built gbOS86 images (Google OS inside: never commit or share)

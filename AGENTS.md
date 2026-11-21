@@ -17,14 +17,16 @@ Read `README.md` (what/how) and `HANDOFF.md` (chronological log of every bug and
   `gbos/logs/boot-N/nvme-logs/` on the stick. Then plug the stick into the Mac.
 - Deploy = `tools/deploy_stick.sh` (copies only changed files, verifies after a remount, ejects the right disk: seconds), then the user boots the stick and picks **1**.
   The updater skips the unchanged big items (system image, firmware, modules; `UPDATE_FULL=1` in gbos.cfg forces everything), so an Update is about a minute, and it saves the previous boots' logs first: one stick boot both reads the last test and applies the next change (no separate "save logs" boot). Kernel changes go to
-  **both** `/Volumes/EFI/EFI/BOOT/BOOTX64.EFI` (what the firmware boots) and `GBOS/EFI/BOOT/`.
+  **both** `/Volumes/EFI/EFI/BOOT/` (what the firmware boots) and `GBOS/EFI/BOOT/`, with `python3 tools/secureboot.py esp DIR`: it signs
+  the kernel with the build machine's key and writes shim as `BOOTX64.EFI`, the kernel as `grubx64.efi` (README "Secure Boot").
 - The stick mounts on macOS as `/Volumes/EFI` and `/Volumes/GBOS`; the disk number changes. Eject with
   `diskutil eject` after `sync`.
 
 ## Traps that already cost hours
 - **Absence of an error is not success.** Check the log actually covers the time of the event (logs were
   truncated by FAT corruption, and by booting an old kernel from the wrong EFI copy).
-- **Confirm the running kernel:** `Linux version ... #N` in `kmsg.log`.
+- **Confirm the running kernel:** `Linux version ... #N` in `kmsg.log`. With shim the kernel is `EFI/BOOT/grubx64.efi`; a bare kernel
+  copied over `BOOTX64.EFI` replaces shim (boots with Secure Boot off only, and that is the kernel `install.sh` then installs).
 - **FAT logs:** reading past a file's real cluster chain gives zeros or EINVAL; copy with
   `dd conv=noerror,sync` and strip NULs. Never let Android (vold) mount the stick.
 - **init `exec`/`service` need an explicit `seclabel`.** Init refuses an exec with no domain transition
@@ -47,6 +49,8 @@ Read `README.md` (what/how) and `HANDOFF.md` (chronological log of every bug and
   `kernel/isa_emu_patch/build.sh`. Modules for kernel #29 must come from the same tree.
 - Emulator test: `kernel/isa_emu_test/run_qemu.py <bzImage>` must print `ISA_EMU_TEST_PASS`.
 - Shell syntax checks: `sh -n usb/hook.sh usb/install.sh usb/stage0_init.sh usb/apex_patch.sh`.
+- Secure Boot: `kernel/isa_emu_test/run_secureboot_qemu.py` must print `SECUREBOOT_QEMU_PASS`; `sh tools/test_secureboot.sh` (installer layout).
+  The signing key stays outside the repository (`~/.config/gbos86/secureboot/`); never commit it.
 
 ## Commits
 End messages with `Co-Authored-By: Example Model <noreply@example.com>` (replace example names with your model's name and provider url, example: "Big Pickle Free <noreply@opencode.ai>"). Add a dated line to
